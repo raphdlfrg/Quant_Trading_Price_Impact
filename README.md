@@ -1,0 +1,1 @@
+Coursework for the Quant Trading course at Imperial
