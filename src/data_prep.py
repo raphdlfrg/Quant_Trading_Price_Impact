@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 
 def load_bin_month(bin_sample_path: str, year: int, month: int) -> pd.DataFrame:
