@@ -1,0 +1,13 @@
+year_month,n_rows_raw,n_stock_days,n_time_bins,n_stocks,total_abs_volume,trade_file,price_file,daily_stock_info_file
+201901,2168002,1050,2341,50,538759147.0,data/rolling_data_preparation\trade_panel_201901.csv,data/rolling_data_preparation\price_panel_201901.csv,data/rolling_data_preparation\daily_stock_info_201901.csv
+201902,2018914,950,2341,50,415172779.0,data/rolling_data_preparation\trade_panel_201902.csv,data/rolling_data_preparation\price_panel_201902.csv,data/rolling_data_preparation\daily_stock_info_201902.csv
+201903,2258058,1050,2341,50,465897772.0,data/rolling_data_preparation\trade_panel_201903.csv,data/rolling_data_preparation\price_panel_201903.csv,data/rolling_data_preparation\daily_stock_info_201903.csv
+201904,2185122,1050,2341,50,408962599.0,data/rolling_data_preparation\trade_panel_201904.csv,data/rolling_data_preparation\price_panel_201904.csv,data/rolling_data_preparation\daily_stock_info_201904.csv
+201905,2364583,1100,2341,50,524344513.0,data/rolling_data_preparation\trade_panel_201905.csv,data/rolling_data_preparation\price_panel_201905.csv,data/rolling_data_preparation\daily_stock_info_201905.csv
+201906,2103978,1000,2341,50,436886509.0,data/rolling_data_preparation\trade_panel_201906.csv,data/rolling_data_preparation\price_panel_201906.csv,data/rolling_data_preparation\daily_stock_info_201906.csv
+201907,2247986,1100,2341,50,424206393.0,data/rolling_data_preparation\trade_panel_201907.csv,data/rolling_data_preparation\price_panel_201907.csv,data/rolling_data_preparation\daily_stock_info_201907.csv
+201908,2343350,1084,2341,50,491355380.0,data/rolling_data_preparation\trade_panel_201908.csv,data/rolling_data_preparation\price_panel_201908.csv,data/rolling_data_preparation\daily_stock_info_201908.csv
+201909,2021472,980,2341,49,366080999.0,data/rolling_data_preparation\trade_panel_201909.csv,data/rolling_data_preparation\price_panel_201909.csv,data/rolling_data_preparation\daily_stock_info_201909.csv
+201910,2321777,1127,2341,49,388501095.0,data/rolling_data_preparation\trade_panel_201910.csv,data/rolling_data_preparation\price_panel_201910.csv,data/rolling_data_preparation\daily_stock_info_201910.csv
+201911,1946544,980,2341,49,327340170.0,data/rolling_data_preparation\trade_panel_201911.csv,data/rolling_data_preparation\price_panel_201911.csv,data/rolling_data_preparation\daily_stock_info_201911.csv
+201912,1858340,931,2341,49,279580516.0,data/rolling_data_preparation\trade_panel_201912.csv,data/rolling_data_preparation\price_panel_201912.csv,data/rolling_data_preparation\daily_stock_info_201912.csv
