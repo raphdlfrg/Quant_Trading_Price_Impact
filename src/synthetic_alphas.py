@@ -57,22 +57,29 @@ def calibrate_synthetic_alpha_params(
 
     rows = []
 
+    # Get unique stocks from the multi-index
     stocks = train_px_df.index.get_level_values(0).unique()
 
     for stock in stocks:
+        # Extract price data for this stock across all training dates
         stock_prices = train_px_df.loc[stock].astype(float)
 
-        current_prices = stock_prices.iloc[:, :-lookahead_bins]
-        future_prices = stock_prices.iloc[:, lookahead_bins:]
+        # Align current and future prices for forward return calculation
+        current_prices = stock_prices.iloc[:, :-lookahead_bins]  # All but last h columns
+        future_prices = stock_prices.iloc[:, lookahead_bins:]    # All but first h columns
 
+        # Reset column indices to align for element-wise operations
         current_prices.columns = range(current_prices.shape[1])
         future_prices.columns = range(future_prices.shape[1])
 
+        # Calculate forward returns: (P_{t+h} - P_t) / P_t
         forward_returns = (future_prices - current_prices) / current_prices
 
-        r_values = forward_returns.to_numpy().ravel()
-        p_values = current_prices.to_numpy().ravel()
+        # Flatten to 1D arrays for statistical calculations
+        r_values = forward_returns.to_numpy().ravel()  # Forward returns
+        p_values = current_prices.to_numpy().ravel()   # Current prices
 
+        # Filter out invalid observations (NaN, inf, or negative prices)
         valid_mask = (
             np.isfinite(r_values)
             & np.isfinite(p_values)
@@ -82,17 +89,23 @@ def calibrate_synthetic_alpha_params(
         r_values = r_values[valid_mask]
         p_values = p_values[valid_mask]
 
-        var_r = np.var(r_values)
-        mean_inv_price_sq = np.mean(1.0 / (p_values ** 2))
+        # Estimate statistical moments needed for alpha calibration
+        var_r = np.var(r_values)  # Variance of forward returns
+        mean_inv_price_sq = np.mean(1.0 / (p_values ** 2))  # E[1/P^2]
 
+        # Calculate calibration parameters x and y
+        # x = rho^2 (deterministic component strength)
         x = target_corr ** 2
 
+        # y = rho * sqrt(1-rho^2) * sqrt(Var(r)/(E[1/P^2] * h))
+        # (stochastic component strength, scaled by price and time)
         y = (
             target_corr
             * np.sqrt(1 - target_corr ** 2)
             * np.sqrt(var_r / (mean_inv_price_sq * lookahead_bins))
         )
 
+        # Store calibration results for this stock
         rows.append({
             "stock": stock,
             "target_corr": target_corr,
@@ -101,9 +114,10 @@ def calibrate_synthetic_alpha_params(
             "mean_inv_price_sq": mean_inv_price_sq,
             "x": x,
             "y": y,
-            "n_obs": len(r_values)
+            "n_obs": len(r_values)  # Number of valid observations
         })
 
+    # Create and format the output DataFrame
     alpha_param_df = pd.DataFrame(rows)
     alpha_param_df = alpha_param_df.set_index("stock").sort_index()
 
@@ -169,85 +183,108 @@ def generate_synthetic_alpha_df(
     if alpha_level <= 0:
         raise ValueError("alpha_level must be positive.")
 
+    # Initialize random number generator for reproducible results
     rng = np.random.default_rng(random_seed)
 
+    # Calculate decay factor for alpha process: alpha decays exponentially
+    # phi_alpha = exp(-ln(2) * dt / half_life) = exp(-dt / (half_life / ln(2)))
     phi_alpha = np.exp(
         -np.log(2) * dt_seconds / alpha_half_life_seconds
     )
 
-    alpha_rows = []
-    alpha_index = []
+    # Storage for results
+    alpha_rows = []      # Will hold alpha time series for each stock-day
+    alpha_index = []     # Will hold (stock, date) tuples
+    diagnostic_rows = [] # Will hold diagnostic statistics
 
-    diagnostic_rows = []
-
+    # Process each stock independently
     stocks = test_px_df.index.get_level_values(0).unique()
 
     for stock in stocks:
+        # Skip stocks not in calibration parameters
         if stock not in alpha_param_df.index:
             continue
 
-        x = float(alpha_param_df.loc[stock, "x"])
-        y = float(alpha_param_df.loc[stock, "y"])
+        # Extract calibrated parameters for this stock
+        x = float(alpha_param_df.loc[stock, "x"])  # Deterministic component weight
+        y = float(alpha_param_df.loc[stock, "y"])  # Stochastic component weight
         target_corr = float(alpha_param_df.loc[stock, "target_corr"])
         lookahead_bins = int(alpha_param_df.loc[stock, "lookahead_bins"])
 
+        # Get price data for this stock across all test dates
         stock_prices_df = test_px_df.loc[stock].astype(float)
 
+        # Storage for diagnostic calculations across all dates for this stock
         all_forward_returns = []
         all_alpha_innovations = []
         all_alpha_values = []
 
+        # Generate alpha for each trading day
         for date in stock_prices_df.index:
             prices = stock_prices_df.loc[date].values.astype(float)
             n = len(prices)
 
-            alpha_innovation = np.zeros(n)
-            forward_return = np.full(n, np.nan)
+            # Initialize arrays for this day
+            alpha_innovation = np.zeros(n)  # Innovation shocks at each time step
+            forward_return = np.full(n, np.nan)  # Forward returns for correlation calc
 
+            # Generate innovation shocks for each time step
             for j in range(n - lookahead_bins):
-                if prices[j] > 0:
+                if prices[j] > 0:  # Valid price check
+                    # Calculate realized forward return
                     r = (
                         prices[j + lookahead_bins] - prices[j]
                     ) / prices[j]
 
+                    # Generate random shock with variance scaled by lookahead_bins
                     delta_w = rng.normal(
                         loc=0.0,
                         scale=np.sqrt(lookahead_bins)
                     )
 
+                    # Innovation = deterministic component + stochastic component
+                    # Deterministic: correlated with forward return
+                    # Stochastic: uncorrelated noise, scaled by 1/price
                     alpha_innovation[j] = x * r + y * delta_w / prices[j]
                     forward_return[j] = r
 
+            # Generate the alpha time series by integrating innovations
             alpha_values = np.zeros(n)
-            alpha_state = 0.0
+            alpha_state = 0.0  # Current alpha state
 
             for j in range(n):
+                # Alpha follows AR(1) process: alpha_t = phi * alpha_{t-1} + innovation_t
                 alpha_state = (
                     phi_alpha * alpha_state
                     + alpha_innovation[j]
                 )
 
+                # Apply scaling factor
                 alpha_values[j] = alpha_level * alpha_state
 
+            # Store results for this stock-day
             alpha_rows.append(alpha_values)
             alpha_index.append((stock, date))
 
+            # Collect data for diagnostics (filtering out NaN forward returns)
             valid_mask = np.isfinite(forward_return)
-
             all_forward_returns.extend(forward_return[valid_mask])
             all_alpha_innovations.extend(alpha_innovation[valid_mask])
             all_alpha_values.extend(alpha_values[valid_mask])
 
+        # Calculate diagnostic correlations for this stock
         all_forward_returns = np.array(all_forward_returns)
         all_alpha_innovations = np.array(all_alpha_innovations)
         all_alpha_values = np.array(all_alpha_values)
 
         if len(all_forward_returns) > 1:
+            # Correlation between innovation shocks and forward returns
             innovation_corr = np.corrcoef(
                 all_alpha_innovations,
                 all_forward_returns
             )[0, 1]
 
+            # Correlation between final alpha signal and forward returns
             alpha_corr = np.corrcoef(
                 all_alpha_values,
                 all_forward_returns
@@ -256,6 +293,7 @@ def generate_synthetic_alpha_df(
             innovation_corr = np.nan
             alpha_corr = np.nan
 
+        # Store diagnostic results
         diagnostic_rows.append({
             "stock": stock,
             "target_corr": target_corr,
@@ -264,10 +302,11 @@ def generate_synthetic_alpha_df(
             "alpha_half_life_seconds": alpha_half_life_seconds,
             "alpha_level": alpha_level,
             "lookahead_bins": lookahead_bins,
-            "phi_alpha": phi_alpha,
-            "n_obs": len(all_forward_returns)
+            "phi_alpha": phi_alpha,  # Decay factor
+            "n_obs": len(all_forward_returns)  # Number of valid observations
         })
 
+    # Create the main output: synthetic alpha DataFrame
     synthetic_alpha_df = pd.DataFrame(
         alpha_rows,
         index=pd.MultiIndex.from_tuples(
@@ -277,6 +316,7 @@ def generate_synthetic_alpha_df(
         columns=test_px_df.columns
     )
 
+    # Create diagnostics DataFrame
     synthetic_alpha_diagnostics_df = pd.DataFrame(diagnostic_rows)
     synthetic_alpha_diagnostics_df = (
         synthetic_alpha_diagnostics_df
