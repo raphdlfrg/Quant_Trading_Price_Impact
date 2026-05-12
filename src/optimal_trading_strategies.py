@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from backtest_engine import *
+from src.backtest_engine import *
 
 def load_panel_csv(path):
     """Load a stock-date x intraday-time panel saved by previous notebooks."""
