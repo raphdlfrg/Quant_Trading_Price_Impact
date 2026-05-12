@@ -122,80 +122,111 @@ def compute_impact_feature_one_day(
     eps=1e-12
 ):
     """
-    Compute impact state feature for one trading day across different models.
-    
-    Evaluates the price impact at each time step based on accumulated trading volume,
-    accounting for mean-reversion of impact over time. Supports three different 
-    impact models with varying specifications.
-    
-    Args:
-        my_trades: Series of trade volumes (positive = buy, negative = sell)
-        ADV: Average daily volume for normalization
-        sigma: Impact sensitivity parameter
-        half_life_seconds: Mean-reversion half-life of impact
-        model_type: 'ow' (Obizhaeva-Wang), 'afs' (Almgren-Fruth-Schied), 
-                   or 'reduced_form'
-        dt_seconds: Time step between observations (default 10 seconds)
-        eps: Small value for numerical stability (default 1e-12)
-    
-    Returns:
-        Series of impact features (normalized by price) at each time step
-        
-    Notes:
-        - OW model: Linear impact I = decay*I + sigma * q/ADV
-        - AFS model: Square-root impact I = decay*I + sigma * sign(q)*sqrt(|q|)/sqrt(ADV)
-        - Reduced-form: Nonlinear with volume weighting
+    Compute one-day impact feature with lambda = 1.
+
+    This function is designed to be consistent with the impact_state()
+    function used in Part 2.2 Impact Model Fitting.
+
+    Models
+    ------
+    ow:
+        I_t is an EMA of sigma * q_t / ADV.
+
+    sqrt_propagator:
+        I_t is an EMA of sigma * sign(q_t) * sqrt(|q_t| / ADV).
+        This matches the exercise-style square-root propagator.
+
+    afs:
+        First compute the linear volume-space state J_t as an EMA of
+        sigma * q_t / ADV, then transform:
+            I_t = sign(J_t) * sqrt(|J_t|)
+
+    reduced_form:
+        First compute local volume v_t as an EMA of |q_t|, then compute
+        the impact input sigma * q_t / sqrt(ADV * v_t), and finally apply
+        the impact EMA.
     """
 
-    my_trades = my_trades.astype(float)
+    my_trades = my_trades.reindex(my_trades.index).fillna(0).astype(float)
 
     ADV = float(ADV)
     sigma = float(sigma)
     half_life_seconds = float(half_life_seconds)
 
-    # Calculate decay factor from half-life: I(t) = decay * I(t-dt)
     beta = np.log(2) / half_life_seconds
     decay = np.exp(-beta * dt_seconds)
 
     feature_values = []
 
+    # ------------------------------------------------------------
+    # 1. OW model
+    # Same as Part 2.2:
+    # pre_ewm = sigma * q / ADV
+    # impact = EMA(pre_ewm)
+    # ------------------------------------------------------------
     if model_type == "ow":
-        # Obizhaeva-Wang: Linear impact model
         I = 0.0
 
         for q in my_trades:
-            # Impact decays exponentially, new trade q adds sigma*q/ADV
-            I = decay * I + sigma * q / ADV
+            input_term = sigma * q / ADV
+            I = decay * I + input_term
             feature_values.append(I)
 
+    # ------------------------------------------------------------
+    # 2. Square-root propagator
+    # Same as the exercise-style sqrt model:
+    # pre_ewm = sigma * sign(q / ADV) * sqrt(|q / ADV|)
+    # impact = EMA(pre_ewm)
+    # ------------------------------------------------------------
+    elif model_type == "sqrt_propagator":
+        I = 0.0
+
+        for q in my_trades:
+            q_scaled = q / ADV
+            input_term = sigma * np.sign(q_scaled) * np.sqrt(abs(q_scaled))
+            I = decay * I + input_term
+            feature_values.append(I)
+
+    # ------------------------------------------------------------
+    # 3. AFS-style model
+    # Same as Part 2.2:
+    # J_t = EMA(sigma * q / ADV)
+    # I_t = sign(J_t) * sqrt(|J_t|)
+    # ------------------------------------------------------------
     elif model_type == "afs":
-        # Almgren-Fruth-Schied: Square-root model
-        I = 0.0
+        J = 0.0
 
         for q in my_trades:
-            # Impact uses square-root of trade size to capture nonlinearity
-            q_kernel = np.sign(q) * np.sqrt(abs(q))
-            I = decay * I + sigma * q_kernel / np.sqrt(ADV)
+            input_term = sigma * q / ADV
+            J = decay * J + input_term
+            I = np.sign(J) * np.sqrt(abs(J))
             feature_values.append(I)
 
+    # ------------------------------------------------------------
+    # 4. Reduced-form model
+    # Same as Part 2.2:
+    # v_t = EMA(|q_t|)
+    # input_t = sigma * q_t / sqrt(ADV * v_t)
+    # I_t = EMA(input_t)
+    # ------------------------------------------------------------
     elif model_type == "reduced_form":
-        # Reduced-form: Volatility-weighted impact
         I = 0.0
         v = 0.0
 
         for q in my_trades:
-            # Track recent volume activity for dynamic weighting
             v = decay * v + abs(q)
-            v = max(v, eps)  # Avoid division by zero
+            v = max(v, eps)
 
-            # Impact depends on trade size relative to recent volume
             input_term = sigma * q / np.sqrt(ADV * v)
             I = decay * I + input_term
 
             feature_values.append(I)
 
     else:
-        raise ValueError("model_type must be 'ow', 'afs', or 'reduced_form'.")
+        raise ValueError(
+            "model_type must be one of: "
+            "'ow', 'sqrt_propagator', 'afs', or 'reduced_form'."
+        )
 
     return pd.Series(feature_values, index=my_trades.index)
 
