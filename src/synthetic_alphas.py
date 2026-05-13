@@ -282,7 +282,7 @@ def generate_synthetic_alpha_df(
 
     return synthetic_alpha_df, synthetic_alpha_diagnostics_df
 
-def generate_synthetic_alpha_mu_df(
+def generate_synthetic_alpha_decay_df(
     synthetic_alpha_df,
     dt_seconds=10
 ):
