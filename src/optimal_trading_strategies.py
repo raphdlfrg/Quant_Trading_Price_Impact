@@ -312,8 +312,278 @@ def run_one_stock_day_paths_for_strategies(
     return paths, pd.DataFrame(summaries).T
 
 
+########################## AFS #################################
 
-##################################################
+def afs_target_impact_from_alpha_and_mu(
+    alpha,
+    alpha_mu,
+    beta,
+    c=0.5,
+    apply_terminal_condition=True,
+):
+    """
+    Compute the AFS target impact state:
+
+        I*_t = 1 / (1 + c) * (alpha_t - beta^{-1} mu_t)
+
+    where:
+
+        mu_t = (alpha_{t+dt} - alpha_t) / dt
+
+    For square-root AFS, c = 0.5, so:
+
+        I*_t = 2/3 * (alpha_t - beta^{-1} mu_t)
+    """
+
+    alpha = (
+        alpha.astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+    alpha_mu = (
+        alpha_mu.astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+    I_star = (1.0 / (1.0 + c)) * (alpha - alpha_mu / beta)
+
+    if apply_terminal_condition:
+        I_star.iloc[-1] = alpha.iloc[-1]
+
+    return I_star
+
+
+def recover_afs_trades_from_target_impact(
+    I_star,
+    lambda_hat,
+    ADV,
+    sigma,
+    half_life_seconds,
+    c=0.5,
+    dt_seconds=10,
+    eps=1e-12,
+):
+    """
+    Recover AFS trades from a target impact path.
+
+    Fitted AFS convention:
+
+        I_t = lambda_hat * sign(J_t) * |J_t|^c
+
+    where the volume-space state evolves as:
+
+        J_t = decay * J_{t-dt} + sigma * q_t / ADV
+
+    Therefore:
+
+        J*_t = sign(I*_t / lambda_hat) * |I*_t / lambda_hat|^{1/c}
+
+    and:
+
+        q_t = (J*_t - decay * J*_{t-dt}) / (sigma / ADV)
+    """
+
+    if (
+        not np.isfinite(lambda_hat)
+        or lambda_hat <= eps
+        or not np.isfinite(ADV)
+        or not np.isfinite(sigma)
+        or ADV <= eps
+        or sigma <= eps
+    ):
+        return pd.Series(0.0, index=I_star.index)
+
+    beta = np.log(2) / half_life_seconds
+    decay = np.exp(-beta * dt_seconds)
+
+    flow_coeff = sigma / ADV
+
+    if not np.isfinite(flow_coeff) or abs(flow_coeff) < eps:
+        return pd.Series(0.0, index=I_star.index)
+
+    # Convert target return-impact into target normalized AFS feature.
+    afs_feature_star = I_star / lambda_hat
+
+    # Invert sign(J) * |J|^c.
+    J_star = (
+        np.sign(afs_feature_star)
+        * np.abs(afs_feature_star) ** (1.0 / c)
+    )
+
+    trades = []
+    prev_J = 0.0
+
+    for target_J in J_star.values.astype(float):
+        q = (target_J - decay * prev_J) / flow_coeff
+        trades.append(q)
+        prev_J = target_J
+
+    return pd.Series(trades, index=I_star.index)
+
+
+def make_afs_optimal_trade_df(
+    alpha_df,
+    test_px_df,
+    scaling_df,
+    fit_df,
+    dt_seconds=10,
+    c=0.5,
+    normalize_abs_volume=True,
+    target_participation=0.20,
+    apply_terminal_condition=True,
+):
+    """
+    Build a stock-date x time trade panel using the AFS optimal strategy.
+
+    For each stock-day:
+
+        alpha_t
+            -> mu_t = (alpha_{t+dt} - alpha_t) / dt
+            -> I*_t = 1/(1+c) * (alpha_t - mu_t / beta)
+            -> J*_t from AFS inverse
+            -> q_t from the fitted J-state recurrence
+
+    Returns
+    -------
+    trades_df:
+        Strategy trade panel.
+
+    target_impact_df:
+        Effective target impact panel after optional volume normalization.
+
+    alpha_mu_df:
+        Forward alpha drift / decay input mu_t.
+
+    strategy_scale_df:
+        Stock-day diagnostics.
+    """
+
+    # Compute mu_t once for the full alpha panel.
+    alpha_mu_df_full = generate_synthetic_alpha_decay_df(
+        synthetic_alpha_df=alpha_df,
+        dt_seconds=dt_seconds,
+    )
+
+    trades_df = pd.DataFrame(
+        0.0,
+        index=test_px_df.index,
+        columns=test_px_df.columns,
+    )
+
+    target_impact_df = pd.DataFrame(
+        0.0,
+        index=test_px_df.index,
+        columns=test_px_df.columns,
+    )
+
+    alpha_mu_df = pd.DataFrame(
+        0.0,
+        index=test_px_df.index,
+        columns=test_px_df.columns,
+    )
+
+    scale_rows = []
+
+    for stock, date in test_px_df.index:
+
+        if stock not in fit_df.index:
+            continue
+
+        if stock not in scaling_df.index:
+            continue
+
+        if (stock, date) not in alpha_df.index:
+            continue
+
+        alpha = (
+            alpha_df
+            .loc[(stock, date)]
+            .reindex(test_px_df.columns)
+            .fillna(0.0)
+            .astype(float)
+        )
+
+        alpha_mu = (
+            alpha_mu_df_full
+            .loc[(stock, date)]
+            .reindex(test_px_df.columns)
+            .fillna(0.0)
+            .astype(float)
+        )
+
+        lambda_hat = float(fit_df.loc[stock, "lambda_hat"])
+        half_life_seconds = float(fit_df.loc[stock, "half_life_seconds"])
+
+        ADV = float(scaling_df.loc[stock, "ADV"])
+        sigma = float(scaling_df.loc[stock, "sigma"])
+
+        beta = np.log(2) / half_life_seconds
+
+        I_star = afs_target_impact_from_alpha_and_mu(
+            alpha=alpha,
+            alpha_mu=alpha_mu,
+            beta=beta,
+            c=c,
+            apply_terminal_condition=apply_terminal_condition,
+        )
+
+        trades = recover_afs_trades_from_target_impact(
+            I_star=I_star,
+            lambda_hat=lambda_hat,
+            ADV=ADV,
+            sigma=sigma,
+            half_life_seconds=half_life_seconds,
+            c=c,
+            dt_seconds=dt_seconds,
+        )
+
+        raw_abs_volume = trades.abs().sum()
+        target_abs_volume = target_participation * ADV
+
+        scale_factor = 1.0
+
+        if normalize_abs_volume and raw_abs_volume > 0:
+            scale_factor = target_abs_volume / raw_abs_volume
+
+            trades = trades * scale_factor
+
+            # AFS is nonlinear:
+            # if trades scale by s, J scales by s,
+            # and impact scales by s^c.
+            I_star = I_star * (scale_factor ** c)
+
+        trades_df.loc[(stock, date)] = trades.values
+        target_impact_df.loc[(stock, date)] = I_star.values
+        alpha_mu_df.loc[(stock, date)] = alpha_mu.values
+
+        scale_rows.append({
+            "stock": stock,
+            "date": date,
+            "ADV": ADV,
+            "sigma": sigma,
+            "lambda_hat": lambda_hat,
+            "half_life_seconds": half_life_seconds,
+            "beta": beta,
+            "c": c,
+            "target_participation": target_participation,
+            "target_abs_volume": target_abs_volume,
+            "raw_abs_volume": raw_abs_volume,
+            "actual_abs_volume": trades.abs().sum(),
+            "net_traded": trades.sum(),
+            "scale_factor": scale_factor,
+            "normalize_abs_volume": normalize_abs_volume,
+            "apply_terminal_condition": apply_terminal_condition,
+        })
+
+    strategy_scale_df = pd.DataFrame(scale_rows)
+
+    return trades_df, target_impact_df, alpha_mu_df, strategy_scale_df
+
+
+
+##############################################################
 
 def plot_one_stock_day_pnl_comparison(paths, stock, date):
     plt.figure(figsize=(12, 5))
