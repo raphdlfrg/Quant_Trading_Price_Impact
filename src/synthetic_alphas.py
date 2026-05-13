@@ -308,68 +308,35 @@ def generate_synthetic_alpha_decay_df(
 
 
 def plot_synthetic_alpha_decay(
+    synthetic_alpha_df,
     synthetic_alpha_decay_df,
     stock,
     date,
-    dt_seconds=10,
     smooth_window=None
 ):
     """
     Plot synthetic alpha together with its synthetic decay signal.
-
-    Parameters
-    ----------
-    synthetic_alpha_decay_df : pd.DataFrame
-        Synthetic alpha decay panel.
-
-        index   = (stock, date)
-        columns = intraday time bins
-
-    stock : str
-        Stock ticker.
-
-    date : str
-        Trading date.
-
-    dt_seconds : int
-        Bin size in seconds.
-
-    smooth_window : int or None
-        Optional rolling window used to smooth the decay signal.
-
-    Returns
-    -------
-    None
     """
 
-    if (stock, date) not in synthetic_alpha_decay_df.index:
+    key = (stock, date)
+
+    if key not in synthetic_alpha_df.index:
+        raise ValueError("(stock, date) not found in synthetic_alpha_df.")
+
+    if key not in synthetic_alpha_decay_df.index:
         raise ValueError("(stock, date) not found in synthetic_alpha_decay_df.")
 
-    alpha_series = (
-        synthetic_alpha_decay_df
-        .loc[(stock, date)]
-        .astype(float)
-    )
-
-    # Lecture convention:
-    # d alpha_t = mu_t dt + sigma dW_t
-    # decay = -mu_t
-
-    alpha_decay = -(
-        alpha_series.shift(-1) - alpha_series
-    ) / dt_seconds
-
-    alpha_decay = alpha_decay.fillna(0.0)
+    alpha_series = synthetic_alpha_df.loc[key].astype(float)
+    decay_series = synthetic_alpha_decay_df.loc[key].astype(float)
 
     if smooth_window is not None and smooth_window > 1:
-        alpha_decay = (
-            alpha_decay
+        decay_series = (
+            decay_series
             .rolling(smooth_window, min_periods=1)
             .mean()
         )
 
     n = len(alpha_series)
-
     x_axis = np.arange(n)
 
     tick_positions = np.linspace(0, n - 1, 8, dtype=int)
@@ -377,29 +344,36 @@ def plot_synthetic_alpha_decay(
 
     fig, ax1 = plt.subplots(figsize=(12, 5))
 
+    alpha_color = "tab:blue"
+    decay_color = "tab:orange"
+
     # Alpha level
     ax1.plot(
         x_axis,
         100 * alpha_series.values,
+        color=alpha_color,
         linewidth=2,
         label="Synthetic alpha"
     )
 
     ax1.set_xlabel("Time")
-    ax1.set_ylabel("Alpha level (%)")
+    ax1.set_ylabel("Alpha level (%)", color=alpha_color)
+    ax1.tick_params(axis="y", labelcolor=alpha_color)
 
     # Alpha decay
     ax2 = ax1.twinx()
 
     ax2.plot(
         x_axis,
-        alpha_decay.values,
+        decay_series.values,
+        color=decay_color,
         linestyle="--",
         linewidth=2,
         label="Alpha decay"
     )
 
-    ax2.set_ylabel("Alpha decay")
+    ax2.set_ylabel("Alpha decay", color=decay_color)
+    ax2.tick_params(axis="y", labelcolor=decay_color)
 
     ax1.set_xticks(tick_positions)
     ax1.set_xticklabels(tick_labels, rotation=45)
@@ -413,9 +387,7 @@ def plot_synthetic_alpha_decay(
         loc="upper left"
     )
 
-    plt.title(
-        f"{stock} on {date} - synthetic alpha and decay"
-    )
+    plt.title(f"{stock} on {date} - synthetic alpha and decay")
 
     plt.tight_layout()
     plt.show()
