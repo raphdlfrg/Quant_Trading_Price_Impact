@@ -282,7 +282,7 @@ def generate_synthetic_alpha_df(
 
     return synthetic_alpha_df, synthetic_alpha_diagnostics_df
 
-def generate_synthetic_alpha_decay_df(
+def generate_synthetic_alpha_mu_df(
     synthetic_alpha_df,
     dt_seconds=10
 ):
@@ -291,13 +291,13 @@ def generate_synthetic_alpha_decay_df(
 
     Lecture convention:
         d alpha_t = mu_t dt + sigma_t dW_t
-        decay_t = -mu_t
+        decay_t = mu_t
 
     Discretely:
-        decay_t = -(alpha_{t+1} - alpha_t) / dt
+        decay_t = (alpha_{t+1} - alpha_t) / dt
     """
 
-    alpha_decay_df = -(
+    alpha_decay_df = (
         synthetic_alpha_df.shift(-1, axis=1)
         - synthetic_alpha_df
     ) / dt_seconds
