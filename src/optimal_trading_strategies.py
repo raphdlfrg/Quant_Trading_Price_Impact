@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
-from src.backtest_engine import *
+from src.backtest_engine import *  # includes make_twap_trade_df and make_round_trip_twap_trade_df
 from src.synthetic_alphas import *
 
 
@@ -895,7 +895,9 @@ def make_nonlinear_optimal_trade_df(
         if stock not in fit_df.index:
             continue
 
-        if stock not in scaling_df.index:
+        try:
+            scaling_row = _get_scaling_row(scaling_df, stock, date)
+        except KeyError:
             continue
 
         alpha = (
@@ -906,8 +908,8 @@ def make_nonlinear_optimal_trade_df(
             .astype(float)
         )
 
-        ADV = float(scaling_df.loc[stock, "ADV"])
-        sigma = float(scaling_df.loc[stock, "sigma"])
+        ADV = float(scaling_row["ADV"])
+        sigma = float(scaling_row["sigma"])
 
         lambda_hat = float(fit_df.loc[stock, "lambda_hat"])
         half_life_seconds = float(fit_df.loc[stock, "half_life_seconds"])
@@ -953,3 +955,274 @@ def make_nonlinear_optimal_trade_df(
 
     return trades_df, impact_state_df, diagnostics_df
 
+
+
+# ============================================================
+# FIXED / ROBUST BENCHMARK AND PERFORMANCE HELPERS
+# ============================================================
+
+# Performance helpers use TWAP schedules imported from src.backtest_engine.
+
+def _aggregate_strategy_daily(backtest_results_df, pnl_col="pnl_bps", daily_pnl_col="daily_pnl"):
+    """
+    Aggregate stock-day backtest rows to a strategy-date portfolio panel.
+
+    Dollar PnL/costs are summed across stocks. Bps metrics and impact states are
+    averaged across stocks because they are normalized quantities.
+    """
+    df = backtest_results_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+
+    agg_spec = {}
+    for col in df.columns:
+        if col in ["strategy", "date", "stock", "backtest_model"]:
+            continue
+        if col in ["daily_pnl", "impact_cost", "total_abs_traded", "net_traded"]:
+            agg_spec[col] = "sum"
+        elif col in ["pnl_bps", "impact_cost_bps", "max_abs_impact"]:
+            agg_spec[col] = "mean"
+
+    group_cols = ["strategy", "date"]
+    if "backtest_model" in df.columns:
+        group_cols = ["backtest_model"] + group_cols
+
+    if not agg_spec:
+        return df[group_cols].drop_duplicates()
+
+    return df.groupby(group_cols, as_index=False).agg(agg_spec)
+
+
+def compute_drawdown(cumulative_pnl):
+    """Drawdown from a cumulative PnL series."""
+    running_max = cumulative_pnl.cummax()
+    return cumulative_pnl - running_max
+
+
+def strategy_performance_summary(
+    backtest_results_df,
+    pnl_col="pnl_bps",
+    daily_pnl_col="daily_pnl",
+    impact_cost_col="impact_cost_bps",
+    turnover_col="total_abs_traded",
+    max_impact_col="max_abs_impact",
+    annualization=252,
+    aggregate_by_date=True,
+):
+    """
+    Compile performance metrics for each strategy.
+
+    By default, stock-day rows are first aggregated to date-level portfolio rows.
+    This makes expected daily PnL, Sharpe, drawdown, and hit-rate true daily
+    strategy metrics rather than pooled stock-day statistics.
+    """
+    df = backtest_results_df.copy()
+    if aggregate_by_date:
+        df = _aggregate_strategy_daily(
+            df,
+            pnl_col=pnl_col,
+            daily_pnl_col=daily_pnl_col,
+        )
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    group_cols = ["strategy"]
+    if "backtest_model" in df.columns:
+        group_cols = ["backtest_model", "strategy"]
+
+    rows = []
+    for keys, g in df.groupby(group_cols):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        key_dict = dict(zip(group_cols, keys))
+
+        g = g.sort_values("date")
+        daily_pnl = g[daily_pnl_col].astype(float)
+        pnl_bps = g[pnl_col].astype(float)
+
+        cum_pnl = daily_pnl.cumsum()
+        drawdown = compute_drawdown(cum_pnl)
+
+        mean_pnl_bps = pnl_bps.mean()
+        vol_pnl_bps = pnl_bps.std(ddof=1)
+        sharpe = np.nan if (pd.isna(vol_pnl_bps) or vol_pnl_bps <= 0) else mean_pnl_bps / vol_pnl_bps * np.sqrt(annualization)
+
+        row = {
+            **key_dict,
+            "n_days": g["date"].nunique(),
+            "mean_daily_pnl": daily_pnl.mean(),
+            "median_daily_pnl": daily_pnl.median(),
+            "std_daily_pnl": daily_pnl.std(ddof=1),
+            "mean_pnl_bps": mean_pnl_bps,
+            "median_pnl_bps": pnl_bps.median(),
+            "std_pnl_bps": vol_pnl_bps,
+            "sharpe_bps": sharpe,
+            "hit_rate": (daily_pnl > 0).mean(),
+            "max_daily_drawdown": drawdown.min(),
+            "final_cumulative_pnl": cum_pnl.iloc[-1] if len(cum_pnl) else np.nan,
+        }
+
+        for col, out_prefix in [
+            (impact_cost_col, "impact_cost_bps"),
+            (turnover_col, "turnover"),
+            (max_impact_col, "max_abs_impact"),
+        ]:
+            if col in g.columns:
+                row[f"mean_{out_prefix}"] = g[col].mean()
+                row[f"median_{out_prefix}"] = g[col].median()
+                row[f"std_{out_prefix}"] = g[col].std(ddof=1)
+                if col == max_impact_col:
+                    row["max_impact_dislocation"] = g[col].max()
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+    index_cols = [c for c in ["backtest_model", "strategy"] if c in out.columns]
+    if index_cols:
+        out = out.set_index(index_cols)
+    if "sharpe_bps" in out.columns:
+        out = out.sort_values("sharpe_bps", ascending=False)
+    return out
+
+
+def plot_cumulative_pnl(backtest_results_df, value_col="pnl_bps", title="Cumulative PnL by strategy", aggregate_by_date=True):
+    df = _aggregate_strategy_daily(backtest_results_df) if aggregate_by_date else backtest_results_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    pivot = df.pivot_table(index="date", columns="strategy", values=value_col, aggfunc="mean").sort_index()
+    cumulative = pivot.cumsum()
+    plt.figure(figsize=(12, 5))
+    for strategy in cumulative.columns:
+        plt.plot(cumulative.index, cumulative[strategy], label=strategy)
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.title(title)
+    plt.xlabel("Date")
+    plt.ylabel(f"Cumulative {value_col}")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+    return cumulative
+
+
+def plot_drawdowns(backtest_results_df, value_col="daily_pnl", title="Drawdowns by strategy", aggregate_by_date=True):
+    df = _aggregate_strategy_daily(backtest_results_df) if aggregate_by_date else backtest_results_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    pivot = df.pivot_table(index="date", columns="strategy", values=value_col, aggfunc="sum").sort_index()
+    cumulative = pivot.cumsum()
+    drawdowns = cumulative.apply(compute_drawdown)
+    plt.figure(figsize=(12, 5))
+    for strategy in drawdowns.columns:
+        plt.plot(drawdowns.index, drawdowns[strategy], label=strategy)
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.title(title)
+    plt.xlabel("Date")
+    plt.ylabel("Drawdown")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+    return drawdowns
+
+
+def plot_cumulative_impact_cost(backtest_results_df, value_col="impact_cost_bps", title="Cumulative impact cost by strategy", aggregate_by_date=True):
+    df = _aggregate_strategy_daily(backtest_results_df) if aggregate_by_date else backtest_results_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    pivot = df.pivot_table(index="date", columns="strategy", values=value_col, aggfunc="mean").sort_index()
+    cumulative = pivot.cumsum()
+    plt.figure(figsize=(12, 5))
+    for strategy in cumulative.columns:
+        plt.plot(cumulative.index, cumulative[strategy], label=strategy)
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.title(title)
+    plt.xlabel("Date")
+    plt.ylabel(f"Cumulative {value_col}")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+    return cumulative
+
+
+def plot_daily_pnl_distribution(backtest_results_df, value_col="pnl_bps", bins=30, title="Daily PnL distribution", aggregate_by_date=True):
+    df = _aggregate_strategy_daily(backtest_results_df) if aggregate_by_date else backtest_results_df.copy()
+    plt.figure(figsize=(10, 5))
+    for strategy, g in df.groupby("strategy"):
+        plt.hist(g[value_col].dropna(), bins=bins, alpha=0.5, density=True, label=strategy)
+    plt.axvline(0, linestyle="--", linewidth=1)
+    plt.title(title)
+    plt.xlabel(value_col)
+    plt.ylabel("Density")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+
+def trade_schedule_summary(strategy_trade_dfs, scaling_df):
+    """Summarise turnover, net trading, and max trade size as fractions of ADV."""
+    rows = []
+    for strategy, trades_df in strategy_trade_dfs.items():
+        for stock, date in trades_df.index:
+            trades = trades_df.loc[(stock, date)].astype(float)
+            try:
+                scaling_row = _get_scaling_row(scaling_df, stock, date)
+                ADV = float(scaling_row["ADV"])
+            except KeyError:
+                continue
+            rows.append({
+                "strategy": strategy,
+                "stock": stock,
+                "date": date,
+                "ADV": ADV,
+                "abs_volume_over_ADV": trades.abs().sum() / ADV,
+                "net_traded_over_ADV": trades.sum() / ADV,
+                "max_abs_trade_over_ADV": trades.abs().max() / ADV,
+            })
+    return pd.DataFrame(rows)
+
+
+def plot_turnover_boxplot(schedule_summary_df, value_col="abs_volume_over_ADV", title="Turnover over ADV by strategy"):
+    df = schedule_summary_df.copy()
+    strategies = df["strategy"].dropna().unique()
+    data = [df.loc[df["strategy"] == s, value_col].dropna() for s in strategies]
+    plt.figure(figsize=(10, 5))
+    plt.boxplot(data, labels=strategies, showfliers=True)
+    plt.axhline(0.2, linestyle="--", linewidth=1, label="20% ADV")
+    plt.title(title)
+    plt.ylabel(value_col)
+    plt.xticks(rotation=30)
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+
+def compute_forward_returns(price_df):
+    """Compute one-step forward simple returns from an intraday price panel."""
+    returns = price_df.pct_change(axis=1).shift(-1, axis=1)
+    return returns.replace([np.inf, -np.inf], np.nan)
+
+
+def alpha_return_correlation(alpha_df, price_df, method="pearson"):
+    """Compute pooled alpha correlation with next-bin returns."""
+    fwd_returns = compute_forward_returns(price_df)
+    common_index = alpha_df.index.intersection(fwd_returns.index)
+    common_cols = alpha_df.columns.intersection(fwd_returns.columns)
+    alpha = alpha_df.loc[common_index, common_cols]
+    returns = fwd_returns.loc[common_index, common_cols]
+    stacked = pd.DataFrame({"alpha": alpha.stack(), "forward_return": returns.stack()}).dropna()
+    ic = stacked["alpha"].corr(stacked["forward_return"], method=method) if len(stacked) else np.nan
+    return ic, stacked
+
+
+def alpha_ic_by_day(alpha_df, price_df, method="pearson"):
+    """Compute daily alpha IC pooled across stocks and intraday bins for each date."""
+    fwd_returns = compute_forward_returns(price_df)
+    common_index = alpha_df.index.intersection(fwd_returns.index)
+    common_cols = alpha_df.columns.intersection(fwd_returns.columns)
+    alpha = alpha_df.loc[common_index, common_cols]
+    returns = fwd_returns.loc[common_index, common_cols]
+
+    rows = []
+    dates = sorted(alpha.index.get_level_values("date").unique()) if isinstance(alpha.index, pd.MultiIndex) else []
+    for date in dates:
+        a = alpha.xs(date, level="date")
+        r = returns.xs(date, level="date")
+        tmp = pd.DataFrame({"alpha": a.stack(), "forward_return": r.stack()}).dropna()
+        ic = tmp["alpha"].corr(tmp["forward_return"], method=method) if len(tmp) > 2 else np.nan
+        rows.append({"date": date, "ic": ic, "n_obs": len(tmp)})
+    return pd.DataFrame(rows)
