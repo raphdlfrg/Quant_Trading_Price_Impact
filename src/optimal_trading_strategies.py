@@ -367,6 +367,77 @@ def make_ow_optimal_trade_df(
     )
 
 
+def nonlinear_trade_summary(
+    trades_df,
+    impact_state_df,
+    diag_df=None,
+):
+    """
+    Summarize nonlinear optimal strategy outputs.
+
+    Parameters
+    ----------
+    trades_df : pd.DataFrame
+        Trade panel indexed by (stock, date).
+
+    impact_state_df : pd.DataFrame
+        Impact-state panel with same shape.
+
+    diag_df : pd.DataFrame or None
+        Optional optimizer diagnostics dataframe.
+
+    Returns
+    -------
+    summary_df : pd.DataFrame
+        Stock-day summary statistics.
+    """
+
+    rows = []
+
+    for stock, date in trades_df.index:
+
+        trades = trades_df.loc[(stock, date)].astype(float)
+
+        impact = (
+            impact_state_df
+            .loc[(stock, date)]
+            .astype(float)
+        )
+
+        row = {
+            "stock": stock,
+            "date": date,
+            "total_abs_traded": trades.abs().sum(),
+            "net_traded": trades.sum(),
+            "max_abs_trade": trades.abs().max(),
+            "mean_abs_trade": trades.abs().mean(),
+            "max_abs_impact": impact.abs().max(),
+            "mean_abs_impact": impact.abs().mean(),
+            "impact_std": impact.std(),
+        }
+
+        rows.append(row)
+
+    summary_df = pd.DataFrame(rows)
+
+    if diag_df is not None and len(diag_df) > 0:
+
+        merge_cols = [
+            c for c in ["stock", "date"]
+            if c in diag_df.columns
+        ]
+
+        if len(merge_cols) == 2:
+
+            summary_df = summary_df.merge(
+                diag_df,
+                on=["stock", "date"],
+                how="left",
+            )
+
+    return summary_df
+
+
 ########################## BACKTEST HELPERS ######################
 def run_strategy_backtests_for_model(
     strategy_trade_dfs,
@@ -845,12 +916,13 @@ def make_nonlinear_optimal_trade_df(
     fit_df,
     model_type,
     dt_seconds=10,
-    smooth_alpha_window=5,
+    control_block_size=30,
+    smooth_alpha_window=None,
     max_fraction_adv_per_bin=0.002,
     turnover_penalty=1e-4,
     terminal_inventory_penalty=1e-2,
     impact_penalty_multiplier=1.0,
-    maxiter=300,
+    maxiter=50,
 ):
     """
     Build optimal strategy for a fitted nonlinear impact model:
@@ -921,7 +993,7 @@ def make_nonlinear_optimal_trade_df(
                 half_life_seconds=half_life_seconds,
                 model_type=model_type,
                 dt_seconds=dt_seconds,
-                control_block_size=30,
+                control_block_size=control_block_size,
                 max_fraction_adv_per_bin=max_fraction_adv_per_bin,
                 turnover_penalty=turnover_penalty,
                 terminal_inventory_penalty=terminal_inventory_penalty,
@@ -945,6 +1017,9 @@ def make_nonlinear_optimal_trade_df(
             "turnover_penalty": turnover_penalty,
             "terminal_inventory_penalty": terminal_inventory_penalty,
             "impact_penalty_multiplier": impact_penalty_multiplier,
+            "control_block_size": control_block_size,
+            "smooth_alpha_window": smooth_alpha_window,
+            "maxiter": maxiter,
         })
 
         diagnostic_rows.append(diagnostics)
@@ -1224,3 +1299,450 @@ def alpha_ic_by_day(alpha_df, price_df, method="pearson"):
         ic = tmp["alpha"].corr(tmp["forward_return"], method=method) if len(tmp) > 2 else np.nan
         rows.append({"date": date, "ic": ic, "n_obs": len(tmp)})
     return pd.DataFrame(rows)
+
+
+
+# ============================================================
+# NONLINEAR DIAGNOSTIC HELPERS
+# ============================================================
+
+def summarize_nonlinear_diagnostics(*diagnostics_dfs):
+    """
+    Summarise nonlinear optimizer diagnostics.
+
+    Accepts either one diagnostics dataframe or several diagnostics dataframes.
+    Each dataframe should contain at least `model_type`, `success`, and the
+    trade fraction diagnostics returned by make_nonlinear_optimal_trade_df.
+    """
+    if len(diagnostics_dfs) == 1:
+        df = diagnostics_dfs[0].copy()
+    else:
+        df = pd.concat([d.copy() for d in diagnostics_dfs if d is not None and len(d) > 0], ignore_index=True)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    group_cols = ["model_type"] if "model_type" in df.columns else []
+
+    agg_cols = [
+        "success",
+        "objective",
+        "total_abs_fraction_adv",
+        "net_fraction_adv",
+        "max_abs_fraction_per_bin",
+        "max_abs_fraction_per_block",
+    ]
+    agg_cols = [c for c in agg_cols if c in df.columns]
+
+    if not group_cols:
+        return df[agg_cols].describe().T
+
+    out = []
+    for model_type, g in df.groupby(group_cols):
+        row = {"model_type": model_type if not isinstance(model_type, tuple) else model_type[0]}
+        if "success" in g.columns:
+            row["success_rate"] = g["success"].mean()
+            row["n_failures"] = int((~g["success"].astype(bool)).sum())
+        for col in agg_cols:
+            if col == "success":
+                continue
+            row[f"mean_{col}"] = g[col].mean()
+            row[f"median_{col}"] = g[col].median()
+            row[f"max_{col}"] = g[col].max()
+        row["n_stock_days"] = len(g)
+        out.append(row)
+    return pd.DataFrame(out).set_index("model_type")
+
+
+def find_failed_nonlinear_optimizations(diagnostics_df):
+    """Return rows where the scipy optimizer failed."""
+    if diagnostics_df is None or diagnostics_df.empty or "success" not in diagnostics_df.columns:
+        return pd.DataFrame()
+    return diagnostics_df.loc[~diagnostics_df["success"].astype(bool)].copy()
+
+
+def nonlinear_trade_summary(trades_df, scaling_df, strategy_name=None):
+    """
+    Summarise a nonlinear trade panel in ADV units.
+
+    Returns one row per stock-day with total absolute turnover, net trading,
+    and maximum bin trade, all normalised by ADV.
+    """
+    rows = []
+    for stock, date in trades_df.index:
+        try:
+            scaling_row = _get_scaling_row(scaling_df, stock, date)
+        except KeyError:
+            continue
+        ADV = float(scaling_row["ADV"])
+        trades = trades_df.loc[(stock, date)].astype(float)
+        row = {
+            "stock": stock,
+            "date": date,
+            "ADV": ADV,
+            "total_abs_traded": trades.abs().sum(),
+            "net_traded": trades.sum(),
+            "max_abs_trade": trades.abs().max(),
+            "total_abs_traded_over_ADV": trades.abs().sum() / ADV,
+            "net_traded_over_ADV": trades.sum() / ADV,
+            "max_abs_trade_over_ADV": trades.abs().max() / ADV,
+        }
+        if strategy_name is not None:
+            row["strategy"] = strategy_name
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# GENERAL STRATEGY COMPARISON PLOTS
+# ============================================================
+
+def compare_strategy_metric_by_model(
+    backtest_results_df,
+    metric="pnl_bps",
+    title=None,
+    by_model=True,
+    showfliers=True,
+):
+    """
+    Boxplot comparing a metric by strategy, optionally split by backtest model.
+    """
+    df = backtest_results_df.copy()
+    if title is None:
+        title = f"{metric} by strategy"
+
+    if by_model and "backtest_model" in df.columns:
+        models = df["backtest_model"].dropna().unique()
+        for model in models:
+            g = df[df["backtest_model"] == model]
+            strategies = g["strategy"].dropna().unique()
+            data = [g.loc[g["strategy"] == s, metric].dropna() for s in strategies]
+            plt.figure(figsize=(10, 5))
+            plt.boxplot(data, labels=strategies, showfliers=showfliers)
+            plt.axhline(0, linestyle="--", linewidth=1)
+            plt.title(f"{title} - {model}")
+            plt.ylabel(metric)
+            plt.xticks(rotation=30)
+            plt.tight_layout()
+            plt.show()
+    else:
+        strategies = df["strategy"].dropna().unique()
+        data = [df.loc[df["strategy"] == s, metric].dropna() for s in strategies]
+        plt.figure(figsize=(10, 5))
+        plt.boxplot(data, labels=strategies, showfliers=showfliers)
+        plt.axhline(0, linestyle="--", linewidth=1)
+        plt.title(title)
+        plt.ylabel(metric)
+        plt.xticks(rotation=30)
+        plt.tight_layout()
+        plt.show()
+
+
+def plot_strategy_cumulative_metric(
+    backtest_results_df,
+    metric="daily_pnl",
+    title=None,
+    aggregate_by_date=True,
+):
+    """
+    Plot cumulative metric by strategy.
+
+    If aggregate_by_date=True, first aggregates stock-day rows to portfolio-day
+    rows using _aggregate_strategy_daily.
+    """
+    df = _aggregate_strategy_daily(backtest_results_df) if aggregate_by_date else backtest_results_df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+
+    group_cols = ["strategy"]
+    if "backtest_model" in df.columns:
+        group_cols = ["backtest_model", "strategy"]
+
+    if title is None:
+        title = f"Cumulative {metric} by strategy"
+
+    plt.figure(figsize=(12, 5))
+    for keys, g in df.groupby(group_cols):
+        if not isinstance(keys, tuple):
+            label = keys
+        else:
+            label = " | ".join(map(str, keys))
+        g = g.sort_values("date")
+        plt.plot(g["date"], g[metric].cumsum(), label=label)
+
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.title(title)
+    plt.xlabel("Date")
+    plt.ylabel(f"Cumulative {metric}")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# LECTURE-STYLE ONE-DAY DIAGNOSTICS
+# ============================================================
+
+def compute_pre_post_execution_impact_one_day(
+    my_trades,
+    ADV,
+    sigma,
+    half_life_seconds,
+    model_type="ow",
+    dt_seconds=10,
+    eps=1e-12,
+):
+    """
+    Compute pre-trade impact, post-trade impact, and execution impact.
+
+    The execution impact is approximated by the midpoint between pre- and
+    post-trade impact, consistent with the OW flat-book lecture intuition.
+    """
+    my_trades = my_trades.fillna(0.0).astype(float)
+
+    beta = np.log(2) / half_life_seconds
+    decay = np.exp(-beta * dt_seconds)
+
+    pre_features = []
+    post_features = []
+    exec_features = []
+
+    if model_type == "ow":
+        I_prev = 0.0
+        for q in my_trades:
+            I_pre = decay * I_prev
+            input_term = sigma * q / ADV
+            I_post = I_pre + input_term
+            I_exec = 0.5 * (I_pre + I_post)
+            pre_features.append(I_pre)
+            post_features.append(I_post)
+            exec_features.append(I_exec)
+            I_prev = I_post
+
+    elif model_type == "sqrt_propagator":
+        I_prev = 0.0
+        for q in my_trades:
+            I_pre = decay * I_prev
+            u = q / ADV
+            input_term = sigma * np.sign(u) * np.sqrt(abs(u))
+            I_post = I_pre + input_term
+            I_exec = 0.5 * (I_pre + I_post)
+            pre_features.append(I_pre)
+            post_features.append(I_post)
+            exec_features.append(I_exec)
+            I_prev = I_post
+
+    elif model_type == "afs":
+        J_prev = 0.0
+        for q in my_trades:
+            J_pre = decay * J_prev
+            J_post = J_pre + sigma * q / ADV
+            I_pre = np.sign(J_pre) * np.sqrt(abs(J_pre))
+            I_post = np.sign(J_post) * np.sqrt(abs(J_post))
+            I_exec = 0.5 * (I_pre + I_post)
+            pre_features.append(I_pre)
+            post_features.append(I_post)
+            exec_features.append(I_exec)
+            J_prev = J_post
+
+    elif model_type == "reduced_form":
+        I_prev = 0.0
+        v_prev = 0.0
+        for q in my_trades:
+            I_pre = decay * I_prev
+            v_pre = decay * v_prev
+            v_post = max(v_pre + abs(q), eps)
+            input_term = sigma * q / np.sqrt(ADV * v_post)
+            I_post = I_pre + input_term
+            I_exec = 0.5 * (I_pre + I_post)
+            pre_features.append(I_pre)
+            post_features.append(I_post)
+            exec_features.append(I_exec)
+            I_prev = I_post
+            v_prev = v_post
+
+    else:
+        raise ValueError("model_type must be one of: 'ow', 'sqrt_propagator', 'afs', 'reduced_form'.")
+
+    return pd.DataFrame(
+        {
+            "pre_impact_feature": pre_features,
+            "post_impact_feature": post_features,
+            "execution_impact_feature": exec_features,
+        },
+        index=my_trades.index,
+    )
+
+
+def simulate_one_stock_day_with_naive_and_realistic_pnl(
+    stock,
+    date,
+    strategy_name,
+    model_type,
+    strategy_trade_dfs,
+    test_px_df,
+    test_traded_volume_df,
+    scaling_df,
+    fit_dfs,
+    dt_seconds=10,
+):
+    """
+    Lecture-style one-stock-day diagnostic.
+
+    Computes impact-free price, impact-resultant price, execution price,
+    cumulative impact, trade size, naive/accounting PnL, and realistic /
+    fundamental PnL.
+    """
+    fit_df = fit_dfs[model_type]
+
+    raw_prices = test_px_df.loc[(stock, date)].astype(float)
+    public_trades = test_traded_volume_df.loc[(stock, date)].astype(float)
+    my_trades = strategy_trade_dfs[strategy_name].loc[(stock, date)].astype(float)
+
+    lambda_hat = float(fit_df.loc[stock, "lambda_hat"])
+    half_life_seconds = float(fit_df.loc[stock, "half_life_seconds"])
+
+    scaling_row = _get_scaling_row(scaling_df, stock, date)
+    ADV = float(scaling_row["ADV"])
+    sigma = float(scaling_row["sigma"])
+
+    impact_free_price = make_impact_adjusted_prices(
+        prices=raw_prices,
+        public_trades=public_trades,
+        lambda_hat=lambda_hat,
+        ADV=ADV,
+        sigma=sigma,
+        half_life_seconds=half_life_seconds,
+        model_type=model_type,
+        dt_seconds=dt_seconds,
+    )
+
+    impact_features = compute_pre_post_execution_impact_one_day(
+        my_trades=my_trades,
+        ADV=ADV,
+        sigma=sigma,
+        half_life_seconds=half_life_seconds,
+        model_type=model_type,
+        dt_seconds=dt_seconds,
+    )
+
+    impact_features = lambda_hat * impact_features
+
+    pre_impact_in_price = impact_free_price.iloc[0] * impact_features["pre_impact_feature"]
+    post_impact_in_price = impact_free_price.iloc[0] * impact_features["post_impact_feature"]
+    execution_impact_in_price = impact_free_price.iloc[0] * impact_features["execution_impact_feature"]
+
+    impact_resultant_price = impact_free_price + post_impact_in_price
+    execution_price = impact_free_price + execution_impact_in_price
+
+    position = my_trades.cumsum()
+    cash = -(my_trades * execution_price).cumsum()
+
+    naive_pnl = cash + position * impact_resultant_price
+    realistic_pnl = cash + position * impact_free_price
+    footprint_pnl = naive_pnl - realistic_pnl
+
+    path_df = pd.DataFrame(
+        {
+            "raw_mid_price": raw_prices,
+            "impact_free_price": impact_free_price,
+            "trade": my_trades,
+            "position": position,
+            "pre_impact_in_price": pre_impact_in_price,
+            "post_impact_in_price": post_impact_in_price,
+            "execution_impact_in_price": execution_impact_in_price,
+            "impact_in_price": post_impact_in_price,
+            "impact_resultant_price": impact_resultant_price,
+            "execution_price": execution_price,
+            "cash": cash,
+            "naive_pnl": naive_pnl,
+            "realistic_pnl": realistic_pnl,
+            "footprint_pnl": footprint_pnl,
+        }
+    )
+
+    summary = {
+        "stock": stock,
+        "date": date,
+        "strategy": strategy_name,
+        "model_type": model_type,
+        "lambda_hat": lambda_hat,
+        "half_life_seconds": half_life_seconds,
+        "ADV": ADV,
+        "sigma": sigma,
+        "final_naive_pnl": naive_pnl.iloc[-1],
+        "final_realistic_pnl": realistic_pnl.iloc[-1],
+        "final_footprint_pnl": footprint_pnl.iloc[-1],
+        "impact_cost": (my_trades * execution_impact_in_price).sum(),
+        "total_abs_traded": my_trades.abs().sum(),
+        "net_traded": my_trades.sum(),
+        "max_abs_impact": post_impact_in_price.abs().max(),
+    }
+
+    return path_df, summary
+
+
+def plot_lecture_style_strategy_diagnostics(
+    path_df,
+    stock,
+    date,
+    strategy_name,
+    model_type,
+    sample_every=10,
+):
+    """
+    Lecture-style plots:
+    1. impact-free price vs impact-resultant price,
+    2. cumulative impact,
+    3. trade size,
+    4. naive/accounting PnL vs realistic/fundamental PnL.
+    """
+    plot_df = path_df.iloc[::sample_every].copy()
+
+    x = np.arange(len(plot_df))
+    tick_positions = np.linspace(0, len(plot_df) - 1, 8, dtype=int)
+    tick_labels = plot_df.index[tick_positions]
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(x, plot_df["impact_free_price"].values, label="Impact-free price")
+    plt.plot(x, plot_df["impact_resultant_price"].values, label="Impact-resultant price")
+    plt.xticks(tick_positions, tick_labels, rotation=45)
+    plt.title(f"{stock} {date} - {strategy_name} under {model_type}: impact-free vs impact-resultant price")
+    plt.xlabel("Time")
+    plt.ylabel("Price")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(x, 100 * plot_df["impact_in_price"].values, label="Cumulative impact")
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.xticks(tick_positions, tick_labels, rotation=45)
+    plt.title(f"{stock} {date} - {strategy_name} under {model_type}: cumulative impact")
+    plt.xlabel("Time")
+    plt.ylabel("Impact, cents")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(12, 4))
+    plt.bar(x, plot_df["trade"].values, width=1.0, label="Trade size")
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.xticks(tick_positions, tick_labels, rotation=45)
+    plt.title(f"{stock} {date} - {strategy_name} under {model_type}: trade size")
+    plt.xlabel("Time")
+    plt.ylabel("Shares")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(x, plot_df["naive_pnl"].values, label="Naive/accounting PnL")
+    plt.plot(x, plot_df["realistic_pnl"].values, label="Realistic/fundamental PnL")
+    plt.axhline(0, linestyle="--", linewidth=1)
+    plt.xticks(tick_positions, tick_labels, rotation=45)
+    plt.title(f"{stock} {date} - {strategy_name} under {model_type}: PnL comparison")
+    plt.xlabel("Time")
+    plt.ylabel("PnL")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.show()
