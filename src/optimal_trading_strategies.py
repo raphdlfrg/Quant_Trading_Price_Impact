@@ -3,6 +3,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 from src.backtest_engine import *
+from src.synthetic_alphas import *
+
 
 
 ########################## LOADING HELPERS ######################
@@ -13,7 +15,6 @@ def load_panel_csv(path):
     df = df.set_index(["stock", "date"]).sort_index()
     df.columns = df.columns.astype(str)
     return df
-
 
 def load_stock_level_csv(path):
     """Load a stock-level CSV and index by stock when possible."""
