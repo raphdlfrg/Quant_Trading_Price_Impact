@@ -1,13 +1,12 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import minimize
+import matplotlib.cm as cm
 from src.backtest_engine import *
 from src.synthetic_alphas import *
 
 
-
-########################## LOADING HELPERS ######################
+##########################LOADING HELPERS######################
 def load_panel_csv(path):
     """Load a stock-date x intraday-time panel saved by previous notebooks."""
     df = pd.read_csv(path)
@@ -17,141 +16,42 @@ def load_panel_csv(path):
     return df
 
 def load_stock_level_csv(path):
-    """Load a stock-level CSV and index by stock when possible."""
     df = pd.read_csv(path)
     if "stock" in df.columns:
         df = df.set_index("stock").sort_index()
     return df
 
+################################################################
 
-########################## PANEL HELPERS ######################
-def smooth_panel_rows(panel_df, window=None):
+def ow_target_impact_from_alpha(alpha, beta, dt_seconds):
     """
-    Smooth each stock-day row across intraday time bins.
+    Compute the OW target impact state:
 
-    A small amount of smoothing is useful because the alpha decay signal is
-    estimated from finite differences and is therefore much noisier than the
-    alpha level itself.
+        I*_t = 1/2 (alpha_t - beta^{-1} mu_t)
+
+    where:
+
+        mu_t ≈ (alpha_{t+dt} - alpha_t) / dt
     """
-    if window is None or window <= 1:
-        return panel_df.copy()
 
-    return (
-        panel_df
-        .T
-        .rolling(window=window, min_periods=1)
-        .mean()
-        .T
+    alpha = (
+        alpha.astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
     )
 
+    mu = (alpha.shift(-1) - alpha) / dt_seconds
+    mu = (
+        mu.replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
 
-def _get_scaling_row(scaling_df, stock, date):
-    """
-    Return ADV and sigma for a stock-date.
+    I_star = 0.5 * (alpha - mu / beta)
 
-    Supports both:
-    - scaling_df indexed by stock;
-    - scaling_df indexed by (stock, date).
-    """
-    if isinstance(scaling_df.index, pd.MultiIndex):
-        return scaling_df.loc[(stock, date)]
-    return scaling_df.loc[stock]
+    # Terminal condition from the OW formula.
+    I_star.iloc[-1] = alpha.iloc[-1]
 
-
-########################## OW STRATEGY ######################
-def make_alpha_decay_df_from_alpha(alpha_df, dt_seconds=10):
-    """
-    Compute the synthetic alpha decay signal from an alpha level panel.
-
-    Lecture convention:
-
-        d alpha_t = mu_t dt + sigma_t dW_t,
-        decay_t = -mu_t.
-
-    Discrete forward-difference approximation:
-
-        decay_j = -(alpha_{j+1} - alpha_j) / dt.
-
-    This helper is mainly a fallback. In the final pipeline, prefer passing
-    the synthetic_alpha_decay_df created in Section 2.4.
-    """
-    decay_df = -(
-        alpha_df.shift(-1, axis=1)
-        - alpha_df
-    ) / dt_seconds
-
-    return decay_df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-
-def ow_target_impact_from_alpha_and_decay(
-    alpha,
-    alpha_decay,
-    beta,
-    smooth_alpha_window=None,
-    smooth_decay_window=10,
-    target_impact_cap=None,
-    force_zero_close=False,
-):
-    """
-    Compute the lecture-note OW target impact state.
-
-    The lecture writes:
-
-        alpha_t = E[S_T - S_t | F_t],
-        d alpha_t = mu_t dt + sigma_t dW_t,
-
-    and, for the simple OW case,
-
-        I*_t = 1/2 (alpha_t - mu_t / beta).
-
-    Since Section 2.4 stores the alpha decay as decay_t = -mu_t, this becomes:
-
-        I*_t = 1/2 (alpha_t + decay_t / beta).
-
-    Parameters
-    ----------
-    alpha : pd.Series
-        Alpha level alpha_t in return units.
-
-    alpha_decay : pd.Series
-        Alpha decay signal -mu_t in return units per second.
-
-    beta : float
-        OW impact decay speed in seconds^{-1}.
-
-    smooth_alpha_window : int or None
-        Optional rolling window for alpha level smoothing.
-
-    smooth_decay_window : int or None
-        Optional rolling window for alpha decay smoothing.
-
-    target_impact_cap : float or None
-        Optional cap on abs(I*_t), in return units.
-
-    force_zero_close : bool
-        If True, force the final target impact to zero. Default is False,
-        because this function returns the raw OW target implied by alpha and
-        decay rather than an execution schedule forced to finish flat.
-    """
-    alpha = alpha.astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    alpha_decay = alpha_decay.reindex(alpha.index).astype(float)
-    alpha_decay = alpha_decay.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    if smooth_alpha_window is not None and smooth_alpha_window > 1:
-        alpha = alpha.rolling(smooth_alpha_window, min_periods=1).mean()
-
-    if smooth_decay_window is not None and smooth_decay_window > 1:
-        alpha_decay = alpha_decay.rolling(smooth_decay_window, min_periods=1).mean()
-
-    I_star = 0.5 * (alpha + alpha_decay / beta)
-
-    if target_impact_cap is not None:
-        I_star = I_star.clip(lower=-target_impact_cap, upper=target_impact_cap)
-
-    if force_zero_close and len(I_star) > 0:
-        I_star.iloc[-1] = 0.0
-
-    return I_star, alpha, alpha_decay
+    return I_star, mu
 
 
 def recover_ow_trades_from_target_impact(
@@ -161,30 +61,12 @@ def recover_ow_trades_from_target_impact(
     sigma,
     half_life_seconds,
     dt_seconds=10,
-    max_trade_fraction_adv_per_bin=None,
     eps=1e-12,
 ):
     """
-    Recover trades using the discrete fitted OW impact equation.
-
-    Your fitted/backtest OW model separates normalized impact feature F from
-    fitted lambda:
-
-        F_j = exp(-beta dt) F_{j-1} + sigma * q_j / ADV,
-        I_j = lambda_hat * F_j.
-
-    Therefore, for a target impact I*_j:
-
-        F*_j = I*_j / lambda_hat,
-        q_j = ADV / sigma * (F*_j - exp(-beta dt) F*_{j-1}).
-
-    Equivalently:
-
-        q_j = ADV / (lambda_hat sigma)
-              * (I*_j - exp(-beta dt) I*_{j-1}).
+    Recover trades using the discrete fitted OW impact equation:
+        I_n = decay * I_{n-1} + lambda_hat * sigma * q_n / ADV.
     """
-    I_star = I_star.astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
     beta = np.log(2) / half_life_seconds
     decay = np.exp(-beta * dt_seconds)
 
@@ -200,92 +82,102 @@ def recover_ow_trades_from_target_impact(
         trades.append(q)
         prev_I = target_I
 
-    trades = pd.Series(trades, index=I_star.index)
-
-    if max_trade_fraction_adv_per_bin is not None:
-        cap = max_trade_fraction_adv_per_bin * ADV
-        trades = trades.clip(lower=-cap, upper=cap)
-
-    return trades
+    return pd.Series(trades, index=I_star.index)
 
 
 def make_ow_optimal_trade_df(
     alpha_df,
-    alpha_decay_df,
     test_px_df,
     scaling_df,
     fit_df,
     dt_seconds=10,
-    smooth_alpha_window=None,
-    smooth_decay_window=10,
-    target_impact_cap=None,
-    max_trade_fraction_adv_per_bin=None,
-    force_zero_close=False,
+    normalize_abs_volume=True,
+    target_participation=0.20,
 ):
     """
-    Build a stock-date x time trade panel from alpha and alpha decay panels
-    using the raw closed-form OW target-impact strategy.
+    Build a stock-date x time trade panel from an alpha panel using the
+    lecture-note OW target-impact formula and fitted OW parameters.
 
     For each stock-day, the function computes:
 
-        alpha_t, decay_t = -mu_t
-            -> I*_t = 1/2 (alpha_t + decay_t / beta)
+        alpha_t
+            -> alpha'_t
+            -> I*_t = 0.5 * (alpha_t - alpha'_t / beta)
             -> q_t from the fitted OW impact equation.
 
-    No daily absolute-volume normalization is applied. The output is the raw
-    OW strategy implied by the fitted OW parameters and the alpha signals.
+    If normalize_abs_volume=True, each stock-day is rescaled so that
+
+        sum_t |q_t| = target_participation * ADV.
+
+    In that case, both the trades and the target impact are rescaled by
+    the same factor. Therefore, target_impact_df represents the effective
+    target impact corresponding to the actual normalized trades.
 
     Parameters
     ----------
     alpha_df : pd.DataFrame
-        Alpha level panel indexed by (stock, date), with intraday time columns.
-
-    alpha_decay_df : pd.DataFrame
-        Alpha decay panel from Section 2.4, same shape as alpha_df. Values are
-        decay_t = -mu_t, not an alpha level and not another finite difference.
+        Alpha panel indexed by (stock, date), with intraday time columns.
 
     test_px_df : pd.DataFrame
         Test price panel. Used for the stock-date index and intraday columns.
 
     scaling_df : pd.DataFrame
-        Stock-level or stock-date table. Must contain ADV and sigma.
+        Stock-level table indexed by stock. Must contain ADV and sigma.
 
     fit_df : pd.DataFrame
-        Fitted OW parameter table indexed by stock. Must contain lambda_hat and
-        half_life_seconds.
+        Fitted OW parameter table indexed by stock.
+        Must contain lambda_hat and half_life_seconds.
+
+    dt_seconds : int
+        Intraday time-bin length in seconds.
+
+    normalize_abs_volume : bool
+        If True, normalize total absolute daily traded volume to
+        target_participation * ADV.
+
+    target_participation : float
+        Target daily participation rate as a fraction of ADV.
 
     Returns
     -------
     trades_df : pd.DataFrame
-        Raw OW trade panel q_{i,d,j}, same shape as test_px_df.
+        Trade panel q_{i,d,j}, same shape as test_px_df.
 
     target_impact_df : pd.DataFrame
-        OW target impact panel I*_{i,d,j}, same shape as test_px_df.
+        Effective target impact panel I*_{i,d,j}, same shape as test_px_df.
 
-    used_alpha_df : pd.DataFrame
-        Alpha level after optional smoothing.
+    alpha_mu_df : pd.DataFrame
+        Alpha mu panel alpha'_{i,d,j}, same shape as test_px_df.
 
-    used_alpha_decay_df : pd.DataFrame
-        Alpha decay after optional smoothing.
-
-    strategy_diagnostics_df : pd.DataFrame
-        Stock-day diagnostics. There is no scale factor because the raw OW
-        strategy is not normalized to a target participation rate.
+    strategy_scale_df : pd.DataFrame
+        Stock-day diagnostics for the normalization step.
     """
-    trades_df = pd.DataFrame(0.0, index=test_px_df.index, columns=test_px_df.columns)
-    target_impact_df = pd.DataFrame(0.0, index=test_px_df.index, columns=test_px_df.columns)
-    used_alpha_df = pd.DataFrame(0.0, index=test_px_df.index, columns=test_px_df.columns)
-    used_alpha_decay_df = pd.DataFrame(0.0, index=test_px_df.index, columns=test_px_df.columns)
 
-    diagnostics_rows = []
+    trades_df = pd.DataFrame(
+        0.0,
+        index=test_px_df.index,
+        columns=test_px_df.columns,
+    )
+
+    target_impact_df = pd.DataFrame(
+        0.0,
+        index=test_px_df.index,
+        columns=test_px_df.columns,
+    )
+
+    alpha_mu_df = pd.DataFrame(
+        0.0,
+        index=test_px_df.index,
+        columns=test_px_df.columns,
+    )
+
+    scale_rows = []
 
     for stock, date in test_px_df.index:
         if stock not in fit_df.index:
             continue
 
-        try:
-            scaling_row = _get_scaling_row(scaling_df, stock, date)
-        except KeyError:
+        if stock not in scaling_df.index:
             continue
 
         alpha = (
@@ -296,30 +188,18 @@ def make_ow_optimal_trade_df(
             .astype(float)
         )
 
-        alpha_decay = (
-            alpha_decay_df
-            .loc[(stock, date)]
-            .reindex(test_px_df.columns)
-            .fillna(0.0)
-            .astype(float)
-        )
-
         lambda_hat = float(fit_df.loc[stock, "lambda_hat"])
         half_life_seconds = float(fit_df.loc[stock, "half_life_seconds"])
 
-        ADV = float(scaling_row["ADV"])
-        sigma = float(scaling_row["sigma"])
+        ADV = float(scaling_df.loc[stock, "ADV"])
+        sigma = float(scaling_df.loc[stock, "sigma"])
 
         beta = np.log(2) / half_life_seconds
 
-        I_star, alpha_used, alpha_decay_used = ow_target_impact_from_alpha_and_decay(
+        I_star, alpha_mu = ow_target_impact_from_alpha(
             alpha=alpha,
-            alpha_decay=alpha_decay,
             beta=beta,
-            smooth_alpha_window=smooth_alpha_window,
-            smooth_decay_window=smooth_decay_window,
-            target_impact_cap=target_impact_cap,
-            force_zero_close=force_zero_close,
+            dt_seconds=dt_seconds,
         )
 
         trades = recover_ow_trades_from_target_impact(
@@ -329,15 +209,24 @@ def make_ow_optimal_trade_df(
             sigma=sigma,
             half_life_seconds=half_life_seconds,
             dt_seconds=dt_seconds,
-            max_trade_fraction_adv_per_bin=max_trade_fraction_adv_per_bin,
         )
+
+        raw_abs_volume = trades.abs().sum()
+        target_abs_volume = target_participation * ADV
+
+        scale_factor = 1.0
+
+        if normalize_abs_volume and raw_abs_volume > 0:
+            scale_factor = target_abs_volume / raw_abs_volume
+
+            trades = trades * scale_factor
+            I_star = I_star * scale_factor
 
         trades_df.loc[(stock, date)] = trades.values
         target_impact_df.loc[(stock, date)] = I_star.values
-        used_alpha_df.loc[(stock, date)] = alpha_used.values
-        used_alpha_decay_df.loc[(stock, date)] = alpha_decay_used.values
+        alpha_mu_df.loc[(stock, date)] = alpha_mu.values
 
-        diagnostics_rows.append({
+        scale_rows.append({
             "stock": stock,
             "date": date,
             "ADV": ADV,
@@ -345,29 +234,19 @@ def make_ow_optimal_trade_df(
             "lambda_hat": lambda_hat,
             "half_life_seconds": half_life_seconds,
             "beta": beta,
-            "smooth_alpha_window": smooth_alpha_window,
-            "smooth_decay_window": smooth_decay_window,
-            "target_impact_cap": target_impact_cap,
-            "max_trade_fraction_adv_per_bin": max_trade_fraction_adv_per_bin,
-            "force_zero_close": force_zero_close,
-            "total_abs_traded": trades.abs().sum(),
+            "target_participation": target_participation,
+            "target_abs_volume": target_abs_volume,
+            "raw_abs_volume": raw_abs_volume,
+            "actual_abs_volume": trades.abs().sum(),
             "net_traded": trades.sum(),
-            "max_abs_trade": trades.abs().max(),
-            "max_abs_target_impact": I_star.abs().max(),
+            "scale_factor": scale_factor,
+            "normalize_abs_volume": normalize_abs_volume,
         })
 
-    strategy_diagnostics_df = pd.DataFrame(diagnostics_rows)
+    strategy_scale_df = pd.DataFrame(scale_rows)
 
-    return (
-        trades_df,
-        target_impact_df,
-        used_alpha_df,
-        used_alpha_decay_df,
-        strategy_diagnostics_df,
-    )
+    return trades_df, target_impact_df, alpha_mu_df, strategy_scale_df
 
-
-########################## BACKTEST HELPERS ######################
 def run_strategy_backtests_for_model(
     strategy_trade_dfs,
     model_type,
@@ -434,15 +313,290 @@ def run_one_stock_day_paths_for_strategies(
     return paths, pd.DataFrame(summaries).T
 
 
-########################## PLOTTING HELPERS ######################
+########################## AFS #################################
+
+def afs_target_impact_from_alpha_and_mu(
+    alpha,
+    alpha_mu,
+    beta,
+    c=0.5,
+    apply_terminal_condition=True,
+):
+    """
+    Compute the AFS target impact state:
+
+        I*_t = 1 / (1 + c) * (alpha_t - beta^{-1} mu_t)
+
+    where:
+
+        mu_t = (alpha_{t+dt} - alpha_t) / dt
+
+    For square-root AFS, c = 0.5, so:
+
+        I*_t = 2/3 * (alpha_t - beta^{-1} mu_t)
+    """
+
+    alpha = (
+        alpha.astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+    alpha_mu = (
+        alpha_mu.astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+    I_star = (1.0 / (1.0 + c)) * (alpha - alpha_mu / beta)
+
+    if apply_terminal_condition:
+        I_star.iloc[-1] = alpha.iloc[-1]
+
+    return I_star
+
+
+def recover_afs_trades_from_target_impact(
+    I_star,
+    lambda_hat,
+    ADV,
+    sigma,
+    half_life_seconds,
+    c=0.5,
+    dt_seconds=10,
+    eps=1e-12,
+):
+    """
+    Recover AFS trades from a target impact path.
+
+    Fitted AFS convention:
+
+        I_t = lambda_hat * sign(J_t) * |J_t|^c
+
+    where the volume-space state evolves as:
+
+        J_t = decay * J_{t-dt} + sigma * q_t / ADV
+
+    Therefore:
+
+        J*_t = sign(I*_t / lambda_hat) * |I*_t / lambda_hat|^{1/c}
+
+    and:
+
+        q_t = (J*_t - decay * J*_{t-dt}) / (sigma / ADV)
+    """
+
+    if (
+        not np.isfinite(lambda_hat)
+        or lambda_hat <= eps
+        or not np.isfinite(ADV)
+        or not np.isfinite(sigma)
+        or ADV <= eps
+        or sigma <= eps
+    ):
+        return pd.Series(0.0, index=I_star.index)
+
+    beta = np.log(2) / half_life_seconds
+    decay = np.exp(-beta * dt_seconds)
+
+    flow_coeff = sigma / ADV
+
+    if not np.isfinite(flow_coeff) or abs(flow_coeff) < eps:
+        return pd.Series(0.0, index=I_star.index)
+
+    # Convert target return-impact into target normalized AFS feature.
+    afs_feature_star = I_star / lambda_hat
+
+    # Invert sign(J) * |J|^c.
+    J_star = (
+        np.sign(afs_feature_star)
+        * np.abs(afs_feature_star) ** (1.0 / c)
+    )
+
+    trades = []
+    prev_J = 0.0
+
+    for target_J in J_star.values.astype(float):
+        q = (target_J - decay * prev_J) / flow_coeff
+        trades.append(q)
+        prev_J = target_J
+
+    return pd.Series(trades, index=I_star.index)
+
+
+def make_afs_optimal_trade_df(
+    alpha_df,
+    test_px_df,
+    scaling_df,
+    fit_df,
+    dt_seconds=10,
+    c=0.5,
+    normalize_abs_volume=True,
+    target_participation=0.20,
+    apply_terminal_condition=True,
+):
+    """
+    Build a stock-date x time trade panel using the AFS optimal strategy.
+
+    For each stock-day:
+
+        alpha_t
+            -> mu_t = (alpha_{t+dt} - alpha_t) / dt
+            -> I*_t = 1/(1+c) * (alpha_t - mu_t / beta)
+            -> J*_t from AFS inverse
+            -> q_t from the fitted J-state recurrence
+
+    Returns
+    -------
+    trades_df:
+        Strategy trade panel.
+
+    target_impact_df:
+        Effective target impact panel after optional volume normalization.
+
+    alpha_mu_df:
+        Forward alpha drift / decay input mu_t.
+
+    strategy_scale_df:
+        Stock-day diagnostics.
+    """
+
+    # Compute mu_t once for the full alpha panel.
+    alpha_mu_df_full = generate_synthetic_alpha_decay_df(
+        synthetic_alpha_df=alpha_df,
+        dt_seconds=dt_seconds,
+    )
+
+    trades_df = pd.DataFrame(
+        0.0,
+        index=test_px_df.index,
+        columns=test_px_df.columns,
+    )
+
+    target_impact_df = pd.DataFrame(
+        0.0,
+        index=test_px_df.index,
+        columns=test_px_df.columns,
+    )
+
+    alpha_mu_df = pd.DataFrame(
+        0.0,
+        index=test_px_df.index,
+        columns=test_px_df.columns,
+    )
+
+    scale_rows = []
+
+    for stock, date in test_px_df.index:
+
+        if stock not in fit_df.index:
+            continue
+
+        if stock not in scaling_df.index:
+            continue
+
+        if (stock, date) not in alpha_df.index:
+            continue
+
+        alpha = (
+            alpha_df
+            .loc[(stock, date)]
+            .reindex(test_px_df.columns)
+            .fillna(0.0)
+            .astype(float)
+        )
+
+        alpha_mu = (
+            alpha_mu_df_full
+            .loc[(stock, date)]
+            .reindex(test_px_df.columns)
+            .fillna(0.0)
+            .astype(float)
+        )
+
+        lambda_hat = float(fit_df.loc[stock, "lambda_hat"])
+        half_life_seconds = float(fit_df.loc[stock, "half_life_seconds"])
+
+        ADV = float(scaling_df.loc[stock, "ADV"])
+        sigma = float(scaling_df.loc[stock, "sigma"])
+
+        beta = np.log(2) / half_life_seconds
+
+        I_star = afs_target_impact_from_alpha_and_mu(
+            alpha=alpha,
+            alpha_mu=alpha_mu,
+            beta=beta,
+            c=c,
+            apply_terminal_condition=apply_terminal_condition,
+        )
+
+        trades = recover_afs_trades_from_target_impact(
+            I_star=I_star,
+            lambda_hat=lambda_hat,
+            ADV=ADV,
+            sigma=sigma,
+            half_life_seconds=half_life_seconds,
+            c=c,
+            dt_seconds=dt_seconds,
+        )
+
+        raw_abs_volume = trades.abs().sum()
+        target_abs_volume = target_participation * ADV
+
+        scale_factor = 1.0
+
+        if normalize_abs_volume and raw_abs_volume > 0:
+            scale_factor = target_abs_volume / raw_abs_volume
+
+            trades = trades * scale_factor
+
+            # AFS is nonlinear:
+            # if trades scale by s, J scales by s,
+            # and impact scales by s^c.
+            I_star = I_star * (scale_factor ** c)
+
+        trades_df.loc[(stock, date)] = trades.values
+        target_impact_df.loc[(stock, date)] = I_star.values
+        alpha_mu_df.loc[(stock, date)] = alpha_mu.values
+
+        scale_rows.append({
+            "stock": stock,
+            "date": date,
+            "ADV": ADV,
+            "sigma": sigma,
+            "lambda_hat": lambda_hat,
+            "half_life_seconds": half_life_seconds,
+            "beta": beta,
+            "c": c,
+            "target_participation": target_participation,
+            "target_abs_volume": target_abs_volume,
+            "raw_abs_volume": raw_abs_volume,
+            "actual_abs_volume": trades.abs().sum(),
+            "net_traded": trades.sum(),
+            "scale_factor": scale_factor,
+            "normalize_abs_volume": normalize_abs_volume,
+            "apply_terminal_condition": apply_terminal_condition,
+        })
+
+    strategy_scale_df = pd.DataFrame(scale_rows)
+
+    return trades_df, target_impact_df, alpha_mu_df, strategy_scale_df
+
+
+
+##############################################################
+
 def plot_one_stock_day_pnl_comparison(paths, stock, date):
     plt.figure(figsize=(12, 5))
 
-    for strategy_name, path_df in paths.items():
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    for i, (strategy_name, path_df) in enumerate(paths.items()):
         plt.plot(
             np.arange(len(path_df)),
             path_df["portfolio_value"],
             label=strategy_name,
+            color=colors[i % len(colors)],
         )
 
     tick_positions = np.linspace(0, len(path_df) - 1, 8, dtype=int)
@@ -460,10 +614,11 @@ def plot_one_stock_day_pnl_comparison(paths, stock, date):
 
 def plot_one_stock_day_final_pnl_bar(summary_df, stock, date):
     plot_df = summary_df.copy()
-    colors = plt.cm.tab10(np.linspace(0, 1, len(plot_df)))
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
     plt.figure(figsize=(9, 4))
-    plt.bar(plot_df.index, plot_df["daily_pnl"], color=colors)
+    plt.bar(plot_df.index, plot_df["daily_pnl"], color=[colors[i % len(colors)] for i in range(len(plot_df))])
     plt.axhline(0, linestyle="--", linewidth=1)
     plt.title(f"{stock} {date} - Final PnL by strategy")
     plt.ylabel("Daily PnL")
@@ -474,10 +629,15 @@ def plot_one_stock_day_final_pnl_bar(summary_df, stock, date):
 
 def plot_one_stock_day_impact_cost_bar(summary_df, stock, date):
     plot_df = summary_df.copy()
-    colors = plt.cm.tab10(np.linspace(0, 1, len(plot_df)))
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
     plt.figure(figsize=(9, 4))
-    plt.bar(plot_df.index, plot_df["impact_cost"], color=colors)
+    plt.bar(
+        plot_df.index,
+        plot_df["impact_cost"],
+        color=[colors[i % len(colors)] for i in range(len(plot_df))],
+    )
     plt.axhline(0, linestyle="--", linewidth=1)
     plt.title(f"{stock} {date} - Impact cost by strategy")
     plt.ylabel("Impact cost")
@@ -562,394 +722,433 @@ def strategy_summary_table(backtest_results_df):
         .agg(["mean", "median", "std"])
         .round(4)
     )
+    
+
+# ============================================================
+# Reduced-form dynamic-liquidity optimal strategy
+# ============================================================
+
+def reduced_form_local_volume_state(q_public, half_life_seconds, dt_seconds=10, eps=1e-12):
+    """
+    Compute the reduced-form local volume state v_t for one stock-day.
+
+    This matches the convention used in impact_model_fitting.impact_state
+    for model_type='reduced_form':
+
+        v_t = EMA(|q_public,t|)
+
+    with the same ewm trick used in the fitting code so that the state
+    recursion corresponds to
+
+        v_n = decay * v_{n-1} + |q_public,n|.
+
+    Parameters
+    ----------
+    q_public : pd.Series
+        Public signed traded volume for one stock-day, indexed by intraday time.
+    half_life_seconds : float
+        Half-life used by the reduced-form impact model.
+    dt_seconds : int
+        Bin size in seconds.
+    eps : float
+        Lower bound to avoid division by zero.
+
+    Returns
+    -------
+    v : pd.Series
+        Local market volume state indexed like q_public.
+    """
+    q_public = (
+        pd.Series(q_public)
+        .astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+    beta = np.log(2) / half_life_seconds
+    decay = np.exp(-beta * dt_seconds)
+    ewm_alpha = 1.0 - decay
+
+    local_input = q_public.abs().copy()
+
+    # Same convention as impact_model_fitting.py:
+    # y_0 = input_0, y_n = decay*y_{n-1} + input_n for n >= 1.
+    if len(local_input) > 1:
+        local_input.iloc[1:] = local_input.iloc[1:] / ewm_alpha
+
+    v = local_input.ewm(alpha=ewm_alpha, adjust=False).mean()
+    v = v.clip(lower=eps)
+
+    return v
 
 
+def reduced_form_gamma_prime_from_volume(
+    local_volume_state,
+    dt_seconds=10,
+    method="log_backward",
+    clip_abs=None,
+):
+    """
+    Compute gamma'_t for the dynamic-liquidity reduced-form model.
+
+    Reduced-form liquidity is lambda_t = lambda / sqrt(v_t), so
+
+        gamma_t = log(lambda_t) = const - 0.5 log(v_t),
+        gamma'_t = -0.5 d log(v_t) / dt.
+
+    The default method uses a backward log-difference, which is stable and
+    uses information available at time t.
+
+    Parameters
+    ----------
+    local_volume_state : pd.Series
+        Positive local volume state v_t.
+    dt_seconds : int
+        Bin size in seconds.
+    method : str
+        'log_backward' or 'level_backward'.
+    clip_abs : float or None
+        Optional cap for |gamma_prime|. Useful to prevent unstable denominators
+        2*beta + gamma_prime.
+
+    Returns
+    -------
+    gamma_prime : pd.Series
+        Liquidity growth term indexed like local_volume_state.
+    """
+    v = (
+        pd.Series(local_volume_state)
+        .astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+        .ffill()
+        .bfill()
+    )
+    v = v.clip(lower=1e-12)
+
+    if method == "log_backward":
+        gamma_prime = -0.5 * (np.log(v) - np.log(v.shift(1))) / dt_seconds
+    elif method == "level_backward":
+        gamma_prime = -0.5 * (v - v.shift(1)) / (dt_seconds * v)
+    else:
+        raise ValueError("method must be 'log_backward' or 'level_backward'.")
+
+    gamma_prime = gamma_prime.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if clip_abs is not None:
+        gamma_prime = gamma_prime.clip(lower=-abs(clip_abs), upper=abs(clip_abs))
+
+    return gamma_prime
 
 
-####This part is for the nonlinear impact models. The code is generated with ChatGPT, so someone should check it.
+def reduced_form_target_impact_from_alpha(
+    alpha,
+    beta,
+    dt_seconds=10,
+    gamma_prime=None,
+    use_dynamic_target=True,
+    denominator_floor=1e-12,
+):
+    """
+    Compute the reduced-form target impact state.
 
-def simulate_fitted_impact_from_trade_fraction(
-    trade_fraction,
-    sigma,
+    Exact dynamic-liquidity target:
+
+        I*_t = ((beta + gamma'_t) / (2 beta + gamma'_t)) alpha_t
+               - (1 / (2 beta + gamma'_t)) mu_t,
+
+    where mu_t ~= (alpha_{t+dt} - alpha_t) / dt.
+
+    If use_dynamic_target=False, use the slow-moving-liquidity heuristic:
+
+        I*_t = 0.5 * (alpha_t - mu_t / beta),
+
+    and only use v_t when translating target impact into trades.
+
+    Returns
+    -------
+    I_star : pd.Series
+        Target actual impact in return units.
+    mu : pd.Series
+        Alpha drift/derivative.
+    """
+    alpha = (
+        pd.Series(alpha)
+        .astype(float)
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0.0)
+    )
+
+    mu = (alpha.shift(-1) - alpha) / dt_seconds
+    mu = mu.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    if (gamma_prime is None) or (not use_dynamic_target):
+        I_star = 0.5 * (alpha - mu / beta)
+    else:
+        gamma_prime = pd.Series(gamma_prime, index=alpha.index).astype(float).fillna(0.0)
+        denom = 2.0 * beta + gamma_prime
+
+        # Avoid division by numbers too close to zero; preserve sign where possible.
+        small = denom.abs() < denominator_floor
+        denom = denom.where(~small, np.sign(denom).replace(0.0, 1.0) * denominator_floor)
+
+        I_star = ((beta + gamma_prime) / denom) * alpha - (mu / denom)
+
+    # Terminal condition analogous to the OW deterministic-alpha formula.
+    I_star.iloc[-1] = alpha.iloc[-1]
+
+    return I_star, mu
+
+
+def recover_reduced_form_trades_from_target_impact(
+    I_star,
     lambda_hat,
+    ADV,
+    sigma,
+    local_volume_state,
     half_life_seconds,
-    model_type,
     dt_seconds=10,
     eps=1e-12,
 ):
     """
-    Simulate fitted impact state in return units.
+    Recover trades from a reduced-form target impact path.
 
-    trade_fraction[j] = q_j / ADV.
-    Output impact_state[j] = lambda_hat * impact_feature[j].
+    The fitted reduced-form impact recursion is
+
+        I_n = decay * I_{n-1}
+              + lambda_hat * sigma * q_n / sqrt(ADV * v_n),
+
+    where v_n is the exogenous local market-volume state computed from
+    the public tape.
+
+    Hence
+
+        q_n = (I*_n - decay * I*_{n-1})
+              * sqrt(ADV * v_n) / (lambda_hat * sigma).
     """
+    I_star = pd.Series(I_star).astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    v = pd.Series(local_volume_state, index=I_star.index).astype(float).clip(lower=eps)
 
     beta = np.log(2) / half_life_seconds
     decay = np.exp(-beta * dt_seconds)
 
-    trade_fraction = np.asarray(trade_fraction, dtype=float)
+    denom = lambda_hat * sigma
+    if abs(denom) < eps or ADV <= eps:
+        return pd.Series(0.0, index=I_star.index)
 
-    impact_feature = np.zeros_like(trade_fraction)
+    trades = []
+    prev_I = 0.0
 
-    if model_type == "sqrt_propagator":
-        I = 0.0
-        for j, u in enumerate(trade_fraction):
-            input_term = sigma * np.sign(u) * np.sqrt(abs(u))
-            I = decay * I + input_term
-            impact_feature[j] = I
+    for target_I, v_t in zip(I_star.values.astype(float), v.values.astype(float)):
+        lambda_eff_t = denom / np.sqrt(ADV * max(v_t, eps))
+        if abs(lambda_eff_t) < eps:
+            q = 0.0
+        else:
+            q = (target_I - decay * prev_I) / lambda_eff_t
+        trades.append(q)
+        prev_I = target_I
 
-    elif model_type == "afs":
-        J = 0.0
-        for j, u in enumerate(trade_fraction):
-            input_term = sigma * u
-            J = decay * J + input_term
-            impact_feature[j] = np.sign(J) * np.sqrt(abs(J))
-
-    elif model_type == "reduced_form":
-        I = 0.0
-        v_fraction = 0.0
-
-        for j, u in enumerate(trade_fraction):
-            v_fraction = decay * v_fraction + abs(u)
-            v_fraction = max(v_fraction, eps)
-
-            input_term = sigma * u / np.sqrt(v_fraction)
-            I = decay * I + input_term
-            impact_feature[j] = I
-
-    else:
-        raise ValueError(
-            "model_type must be one of: "
-            "'sqrt_propagator', 'afs', 'reduced_form'."
-        )
-
-    return lambda_hat * impact_feature
+    return pd.Series(trades, index=I_star.index)
 
 
-def nonlinear_strategy_objective(
-    trade_fraction,
-    alpha,
-    sigma,
-    lambda_hat,
-    half_life_seconds,
-    model_type,
-    dt_seconds=10,
-    turnover_penalty=1e-4,
-    terminal_inventory_penalty=1e-2,
-    impact_penalty_multiplier=1.0,
-):
-    """
-    Minimize negative utility.
-
-    Approximate utility:
-        alpha gain
-        - impact cost
-        - turnover penalty
-        - terminal inventory penalty
-
-    Everything is expressed in return units and ADV fractions.
-    """
-
-    trade_fraction = np.asarray(trade_fraction, dtype=float)
-    alpha = np.asarray(alpha, dtype=float)
-
-    impact = simulate_fitted_impact_from_trade_fraction(
-        trade_fraction=trade_fraction,
-        sigma=sigma,
-        lambda_hat=lambda_hat,
-        half_life_seconds=half_life_seconds,
-        model_type=model_type,
-        dt_seconds=dt_seconds,
-    )
-
-    alpha_gain = np.sum(alpha * trade_fraction)
-    impact_cost = np.sum(impact * trade_fraction)
-
-    turnover_cost = turnover_penalty * np.sum(trade_fraction ** 2)
-
-    final_inventory = np.sum(trade_fraction)
-    terminal_cost = terminal_inventory_penalty * final_inventory ** 2
-
-    utility = (
-        alpha_gain
-        - impact_penalty_multiplier * impact_cost
-        - turnover_cost
-        - terminal_cost
-    )
-
-    return -utility
-
-
-def optimize_nonlinear_strategy_one_day(
-    alpha,
-    ADV,
-    sigma,
-    lambda_hat,
-    half_life_seconds,
-    model_type,
-    dt_seconds=10,
-    control_block_size=30,   # 30 x 10s = 5 minutes
-    max_fraction_adv_per_bin=0.002,
-    turnover_penalty=1e-4,
-    terminal_inventory_penalty=1e-2,
-    impact_penalty_multiplier=1.0,
-    initial_trade_fraction=None,
-    maxiter=50,
-):
-    """
-    Compute one-day optimal trades for a nonlinear fitted impact model.
-
-    Optimization is done on a coarse control grid:
-        one decision every `control_block_size` 10-second bins.
-
-    The optimized coarse trade is then spread evenly across the
-    corresponding 10-second bins.
-    """
-
-    # ------------------------------------------------------------
-    # Clean alpha
-    # ------------------------------------------------------------
-    alpha = alpha.astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    n_fine = len(alpha)
-
-    # ------------------------------------------------------------
-    # Smooth and aggregate alpha to coarse 5-minute blocks
-    # ------------------------------------------------------------
-    alpha_smooth = alpha.rolling(
-        control_block_size,
-        min_periods=1
-    ).mean()
-
-    block_id = np.arange(n_fine) // control_block_size
-
-    alpha_coarse = (
-        alpha_smooth
-        .groupby(block_id)
-        .mean()
-    )
-
-    n_coarse = len(alpha_coarse)
-
-    # ------------------------------------------------------------
-    # Initial guess on coarse grid
-    # ------------------------------------------------------------
-    if initial_trade_fraction is None:
-        x0 = np.zeros(n_coarse)
-    else:
-        x0 = np.asarray(initial_trade_fraction, dtype=float)
-
-        if len(x0) == n_fine:
-            # Convert fine initial guess to coarse totals
-            x0 = pd.Series(x0).groupby(block_id).sum().values
-
-        elif len(x0) != n_coarse:
-            raise ValueError(
-                "initial_trade_fraction must have length equal to "
-                "either the fine grid or the coarse grid."
-            )
-
-    # ------------------------------------------------------------
-    # Bounds on coarse trades
-    # ------------------------------------------------------------
-    # max_fraction_adv_per_bin is a 10-second limit.
-    # A 5-minute block contains control_block_size bins, so the
-    # coarse block can trade up to control_block_size times more.
-    max_fraction_adv_per_block = (
-        max_fraction_adv_per_bin * control_block_size
-    )
-
-    bounds = [
-        (-max_fraction_adv_per_block, max_fraction_adv_per_block)
-        for _ in range(n_coarse)
-    ]
-
-    # ------------------------------------------------------------
-    # Optimize on coarse grid
-    # ------------------------------------------------------------
-    result = minimize(
-        fun=nonlinear_strategy_objective,
-        x0=x0,
-        args=(
-            alpha_coarse.values,
-            sigma,
-            lambda_hat,
-            half_life_seconds,
-            model_type,
-            dt_seconds * control_block_size,
-            turnover_penalty,
-            terminal_inventory_penalty,
-            impact_penalty_multiplier,
-        ),
-        method="L-BFGS-B",
-        bounds=bounds,
-        options={
-            "maxiter": maxiter,
-            "ftol": 1e-8,
-        },
-    )
-
-    coarse_fraction = result.x
-
-    # ------------------------------------------------------------
-    # Expand coarse trades back to fine 10-second grid
-    # ------------------------------------------------------------
-    fine_fraction = np.repeat(
-        coarse_fraction / control_block_size,
-        control_block_size
-    )[:n_fine]
-
-    optimal_fraction = pd.Series(
-        fine_fraction,
-        index=alpha.index,
-        name="trade_fraction_ADV",
-    )
-
-    optimal_trades = ADV * optimal_fraction
-
-    # ------------------------------------------------------------
-    # Compute fine-grid impact state from the fine trades
-    # ------------------------------------------------------------
-    impact_state = simulate_fitted_impact_from_trade_fraction(
-        trade_fraction=optimal_fraction.values,
-        sigma=sigma,
-        lambda_hat=lambda_hat,
-        half_life_seconds=half_life_seconds,
-        model_type=model_type,
-        dt_seconds=dt_seconds,
-    )
-
-    impact_state = pd.Series(
-        impact_state,
-        index=alpha.index,
-        name="impact_state",
-    )
-
-    diagnostics = {
-        "success": result.success,
-        "message": result.message,
-        "objective": result.fun,
-        "n_fine_controls": n_fine,
-        "n_coarse_controls": n_coarse,
-        "control_block_size": control_block_size,
-        "total_abs_fraction_adv": float(np.abs(optimal_fraction).sum()),
-        "net_fraction_adv": float(optimal_fraction.sum()),
-        "max_abs_fraction_per_bin": float(np.abs(optimal_fraction).max()),
-        "max_abs_fraction_per_block": float(np.abs(coarse_fraction).max()),
-    }
-
-    return optimal_trades, optimal_fraction, impact_state, diagnostics
-
-
-def make_nonlinear_optimal_trade_df(
+def make_reduced_form_optimal_trade_df(
     alpha_df,
     test_px_df,
+    test_traded_volume_df,
     scaling_df,
     fit_df,
-    model_type,
     dt_seconds=10,
-    smooth_alpha_window=5,
-    max_fraction_adv_per_bin=0.002,
-    turnover_penalty=1e-4,
-    terminal_inventory_penalty=1e-2,
-    impact_penalty_multiplier=1.0,
-    maxiter=300,
+    normalize_abs_volume=True,
+    target_participation=0.20,
+    use_dynamic_target=True,
+    gamma_method="log_backward",
+    gamma_clip_multiple=0.5,
 ):
     """
-    Build optimal strategy for a fitted nonlinear impact model:
-        'afs', 'reduced_form', or 'sqrt_propagator'.
+    Build optimal strategy trades for the reduced-form dynamic-liquidity model.
+
+    Compared with OW, there are two changes:
+
+    1. The target impact may use gamma'_t:
+
+        I*_t = ((beta + gamma'_t)/(2 beta + gamma'_t)) alpha_t
+               - mu_t/(2 beta + gamma'_t).
+
+       If use_dynamic_target=False, this falls back to the OW/slow-liquidity
+       target I*_t = 0.5(alpha_t - mu_t / beta).
+
+    2. The inverse impact equation uses time-varying liquidity:
+
+        q_t = (I*_t - decay I*_{t-1}) sqrt(ADV v_t) / (lambda_hat sigma).
+
+    Parameters
+    ----------
+    alpha_df : pd.DataFrame
+        Stock-date x time alpha panel.
+    test_px_df : pd.DataFrame
+        Stock-date x time price panel, used for index/columns.
+    test_traded_volume_df : pd.DataFrame
+        Public signed trade panel, used to compute v_t.
+    scaling_df : pd.DataFrame
+        Stock-level ADV/sigma table indexed by stock.
+    fit_df : pd.DataFrame
+        Reduced-form fitted parameters indexed by stock.
+    normalize_abs_volume : bool
+        If True, rescale each stock-day so sum |q_t| = target_participation * ADV.
+    use_dynamic_target : bool
+        If True, use gamma'_t in the target impact formula. If False, use the
+        slow-moving-liquidity target and only use v_t in the trade inversion.
+    gamma_clip_multiple : float or None
+        Optional cap |gamma'_t| <= gamma_clip_multiple * beta. This prevents
+        unstable target denominators. Set to None to disable.
+
+    Returns
+    -------
+    trades_df : pd.DataFrame
+    target_impact_df : pd.DataFrame
+    alpha_mu_df : pd.DataFrame
+    local_volume_df : pd.DataFrame
+    gamma_prime_df : pd.DataFrame
+    strategy_scale_df : pd.DataFrame
     """
+    trades_df = pd.DataFrame(0.0, index=test_px_df.index, columns=test_px_df.columns)
+    target_impact_df = pd.DataFrame(0.0, index=test_px_df.index, columns=test_px_df.columns)
+    alpha_mu_df = pd.DataFrame(0.0, index=test_px_df.index, columns=test_px_df.columns)
+    local_volume_df = pd.DataFrame(0.0, index=test_px_df.index, columns=test_px_df.columns)
+    gamma_prime_df = pd.DataFrame(0.0, index=test_px_df.index, columns=test_px_df.columns)
 
-    if model_type not in ["afs", "reduced_form", "sqrt_propagator"]:
-        raise ValueError(
-            "model_type must be 'afs', 'reduced_form', or 'sqrt_propagator'."
-        )
-
-    # Optional smoothing of alpha
-    if smooth_alpha_window is not None and smooth_alpha_window > 1:
-        alpha_used_df = (
-            alpha_df
-            .T
-            .rolling(smooth_alpha_window, min_periods=1)
-            .mean()
-            .T
-        )
-    else:
-        alpha_used_df = alpha_df.copy()
-
-    trades_df = pd.DataFrame(
-        0.0,
-        index=test_px_df.index,
-        columns=test_px_df.columns,
-    )
-
-    impact_state_df = pd.DataFrame(
-        0.0,
-        index=test_px_df.index,
-        columns=test_px_df.columns,
-    )
-
-    diagnostic_rows = []
+    scale_rows = []
 
     for stock, date in test_px_df.index:
-
-        if stock not in fit_df.index:
+        if stock not in fit_df.index or stock not in scaling_df.index:
+            continue
+        if (stock, date) not in alpha_df.index or (stock, date) not in test_traded_volume_df.index:
             continue
 
-        if stock not in scaling_df.index:
-            continue
-
-        alpha = (
-            alpha_used_df
-            .loc[(stock, date)]
-            .reindex(test_px_df.columns)
-            .fillna(0.0)
-            .astype(float)
-        )
-
-        ADV = float(scaling_df.loc[stock, "ADV"])
-        sigma = float(scaling_df.loc[stock, "sigma"])
+        alpha = alpha_df.loc[(stock, date)].reindex(test_px_df.columns).fillna(0.0).astype(float)
+        q_public = test_traded_volume_df.loc[(stock, date)].reindex(test_px_df.columns).fillna(0.0).astype(float)
 
         lambda_hat = float(fit_df.loc[stock, "lambda_hat"])
         half_life_seconds = float(fit_df.loc[stock, "half_life_seconds"])
+        ADV = float(scaling_df.loc[stock, "ADV"])
+        sigma = float(scaling_df.loc[stock, "sigma"])
 
-        trades, trade_fraction, impact_state, diagnostics = (
-            optimize_nonlinear_strategy_one_day(
-                alpha=alpha,
-                ADV=ADV,
-                sigma=sigma,
-                lambda_hat=lambda_hat,
-                half_life_seconds=half_life_seconds,
-                model_type=model_type,
-                dt_seconds=dt_seconds,
-                control_block_size=30,
-                max_fraction_adv_per_bin=max_fraction_adv_per_bin,
-                turnover_penalty=turnover_penalty,
-                terminal_inventory_penalty=terminal_inventory_penalty,
-                impact_penalty_multiplier=impact_penalty_multiplier,
-                maxiter=maxiter,
-            )
+        beta = np.log(2) / half_life_seconds
+
+        v = reduced_form_local_volume_state(
+            q_public=q_public,
+            half_life_seconds=half_life_seconds,
+            dt_seconds=dt_seconds,
         )
 
-        trades_df.loc[(stock, date)] = trades.values
-        impact_state_df.loc[(stock, date)] = impact_state.values
+        gamma_clip = None if gamma_clip_multiple is None else gamma_clip_multiple * beta
+        gamma_prime = reduced_form_gamma_prime_from_volume(
+            local_volume_state=v,
+            dt_seconds=dt_seconds,
+            method=gamma_method,
+            clip_abs=gamma_clip,
+        )
 
-        diagnostics.update({
+        I_star, alpha_mu = reduced_form_target_impact_from_alpha(
+            alpha=alpha,
+            beta=beta,
+            dt_seconds=dt_seconds,
+            gamma_prime=gamma_prime,
+            use_dynamic_target=use_dynamic_target,
+        )
+
+        trades = recover_reduced_form_trades_from_target_impact(
+            I_star=I_star,
+            lambda_hat=lambda_hat,
+            ADV=ADV,
+            sigma=sigma,
+            local_volume_state=v,
+            half_life_seconds=half_life_seconds,
+            dt_seconds=dt_seconds,
+        )
+
+        raw_abs_volume = trades.abs().sum()
+        target_abs_volume = target_participation * ADV
+        scale_factor = 1.0
+
+        if normalize_abs_volume and raw_abs_volume > 0:
+            scale_factor = target_abs_volume / raw_abs_volume
+            trades = trades * scale_factor
+            I_star = I_star * scale_factor
+
+        trades_df.loc[(stock, date)] = trades.values
+        target_impact_df.loc[(stock, date)] = I_star.values
+        alpha_mu_df.loc[(stock, date)] = alpha_mu.values
+        local_volume_df.loc[(stock, date)] = v.values
+        gamma_prime_df.loc[(stock, date)] = gamma_prime.values
+
+        scale_rows.append({
             "stock": stock,
             "date": date,
-            "model_type": model_type,
+            "model_type": "reduced_form",
             "ADV": ADV,
             "sigma": sigma,
             "lambda_hat": lambda_hat,
             "half_life_seconds": half_life_seconds,
-            "max_fraction_adv_per_bin_input": max_fraction_adv_per_bin,
-            "turnover_penalty": turnover_penalty,
-            "terminal_inventory_penalty": terminal_inventory_penalty,
-            "impact_penalty_multiplier": impact_penalty_multiplier,
+            "beta": beta,
+            "use_dynamic_target": use_dynamic_target,
+            "gamma_method": gamma_method,
+            "gamma_clip_multiple": gamma_clip_multiple,
+            "target_participation": target_participation,
+            "target_abs_volume": target_abs_volume,
+            "raw_abs_volume": raw_abs_volume,
+            "actual_abs_volume": trades.abs().sum(),
+            "net_traded": trades.sum(),
+            "scale_factor": scale_factor,
+            "normalize_abs_volume": normalize_abs_volume,
+            "mean_local_volume": float(v.mean()),
+            "mean_gamma_prime": float(gamma_prime.mean()),
+            "max_abs_gamma_prime": float(gamma_prime.abs().max()),
         })
 
-        diagnostic_rows.append(diagnostics)
+    strategy_scale_df = pd.DataFrame(scale_rows)
 
-    diagnostics_df = pd.DataFrame(diagnostic_rows)
+    return (
+        trades_df,
+        target_impact_df,
+        alpha_mu_df,
+        local_volume_df,
+        gamma_prime_df,
+        strategy_scale_df,
+    )
 
-    return trades_df, impact_state_df, diagnostics_df
 
+def reduced_form_recompute_impact_from_trades(
+    strategy_trades,
+    q_public,
+    lambda_hat,
+    ADV,
+    sigma,
+    half_life_seconds,
+    dt_seconds=10,
+):
+    """
+    Diagnostic helper for one stock-day.
+
+    Recompute the actual reduced-form impact generated by strategy_trades,
+    using the public tape q_public to compute the exogenous local-volume
+    state v_t. This should track target_impact_df if no trade normalization
+    or clipping mismatch exists.
+    """
+    strategy_trades = pd.Series(strategy_trades).astype(float).fillna(0.0)
+    q_public = pd.Series(q_public, index=strategy_trades.index).astype(float).fillna(0.0)
+
+    v = reduced_form_local_volume_state(q_public, half_life_seconds, dt_seconds)
+
+    beta = np.log(2) / half_life_seconds
+    decay = np.exp(-beta * dt_seconds)
+
+    impact = []
+    prev_I = 0.0
+
+    for q_t, v_t in zip(strategy_trades.values, v.values):
+        lambda_eff_t = lambda_hat * sigma / np.sqrt(ADV * max(v_t, 1e-12))
+        I_t = decay * prev_I + lambda_eff_t * q_t
+        impact.append(I_t)
+        prev_I = I_t
+
+    return pd.Series(impact, index=strategy_trades.index)
