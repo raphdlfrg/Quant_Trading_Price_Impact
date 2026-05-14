@@ -688,45 +688,94 @@ def optimize_nonlinear_strategy_one_day(
     half_life_seconds,
     model_type,
     dt_seconds=10,
+    control_block_size=30,   # 30 x 10s = 5 minutes
     max_fraction_adv_per_bin=0.002,
     turnover_penalty=1e-4,
     terminal_inventory_penalty=1e-2,
     impact_penalty_multiplier=1.0,
     initial_trade_fraction=None,
-    maxiter=300,
+    maxiter=50,
 ):
     """
     Compute one-day optimal trades for a nonlinear fitted impact model.
 
-    The optimizer chooses u_j = q_j / ADV.
-    Final output is q_j in shares.
+    Optimization is done on a coarse control grid:
+        one decision every `control_block_size` 10-second bins.
+
+    The optimized coarse trade is then spread evenly across the
+    corresponding 10-second bins.
     """
 
+    # ------------------------------------------------------------
+    # Clean alpha
+    # ------------------------------------------------------------
     alpha = alpha.astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    n = len(alpha)
+    n_fine = len(alpha)
 
+    # ------------------------------------------------------------
+    # Smooth and aggregate alpha to coarse 5-minute blocks
+    # ------------------------------------------------------------
+    alpha_smooth = alpha.rolling(
+        control_block_size,
+        min_periods=1
+    ).mean()
+
+    block_id = np.arange(n_fine) // control_block_size
+
+    alpha_coarse = (
+        alpha_smooth
+        .groupby(block_id)
+        .mean()
+    )
+
+    n_coarse = len(alpha_coarse)
+
+    # ------------------------------------------------------------
+    # Initial guess on coarse grid
+    # ------------------------------------------------------------
     if initial_trade_fraction is None:
-        x0 = np.zeros(n)
+        x0 = np.zeros(n_coarse)
     else:
         x0 = np.asarray(initial_trade_fraction, dtype=float)
-        if len(x0) != n:
-            raise ValueError("initial_trade_fraction must have same length as alpha.")
+
+        if len(x0) == n_fine:
+            # Convert fine initial guess to coarse totals
+            x0 = pd.Series(x0).groupby(block_id).sum().values
+
+        elif len(x0) != n_coarse:
+            raise ValueError(
+                "initial_trade_fraction must have length equal to "
+                "either the fine grid or the coarse grid."
+            )
+
+    # ------------------------------------------------------------
+    # Bounds on coarse trades
+    # ------------------------------------------------------------
+    # max_fraction_adv_per_bin is a 10-second limit.
+    # A 5-minute block contains control_block_size bins, so the
+    # coarse block can trade up to control_block_size times more.
+    max_fraction_adv_per_block = (
+        max_fraction_adv_per_bin * control_block_size
+    )
 
     bounds = [
-        (-max_fraction_adv_per_bin, max_fraction_adv_per_bin)
-        for _ in range(n)
+        (-max_fraction_adv_per_block, max_fraction_adv_per_block)
+        for _ in range(n_coarse)
     ]
 
+    # ------------------------------------------------------------
+    # Optimize on coarse grid
+    # ------------------------------------------------------------
     result = minimize(
         fun=nonlinear_strategy_objective,
         x0=x0,
         args=(
-            alpha.values,
+            alpha_coarse.values,
             sigma,
             lambda_hat,
             half_life_seconds,
             model_type,
-            dt_seconds,
+            dt_seconds * control_block_size,
             turnover_penalty,
             terminal_inventory_penalty,
             impact_penalty_multiplier,
@@ -735,18 +784,31 @@ def optimize_nonlinear_strategy_one_day(
         bounds=bounds,
         options={
             "maxiter": maxiter,
-            "ftol": 1e-10,
+            "ftol": 1e-8,
         },
     )
 
+    coarse_fraction = result.x
+
+    # ------------------------------------------------------------
+    # Expand coarse trades back to fine 10-second grid
+    # ------------------------------------------------------------
+    fine_fraction = np.repeat(
+        coarse_fraction / control_block_size,
+        control_block_size
+    )[:n_fine]
+
     optimal_fraction = pd.Series(
-        result.x,
+        fine_fraction,
         index=alpha.index,
         name="trade_fraction_ADV",
     )
 
     optimal_trades = ADV * optimal_fraction
 
+    # ------------------------------------------------------------
+    # Compute fine-grid impact state from the fine trades
+    # ------------------------------------------------------------
     impact_state = simulate_fitted_impact_from_trade_fraction(
         trade_fraction=optimal_fraction.values,
         sigma=sigma,
@@ -766,9 +828,13 @@ def optimize_nonlinear_strategy_one_day(
         "success": result.success,
         "message": result.message,
         "objective": result.fun,
+        "n_fine_controls": n_fine,
+        "n_coarse_controls": n_coarse,
+        "control_block_size": control_block_size,
         "total_abs_fraction_adv": float(np.abs(optimal_fraction).sum()),
         "net_fraction_adv": float(optimal_fraction.sum()),
         "max_abs_fraction_per_bin": float(np.abs(optimal_fraction).max()),
+        "max_abs_fraction_per_block": float(np.abs(coarse_fraction).max()),
     }
 
     return optimal_trades, optimal_fraction, impact_state, diagnostics
@@ -855,6 +921,7 @@ def make_nonlinear_optimal_trade_df(
                 half_life_seconds=half_life_seconds,
                 model_type=model_type,
                 dt_seconds=dt_seconds,
+                control_block_size=30,
                 max_fraction_adv_per_bin=max_fraction_adv_per_bin,
                 turnover_penalty=turnover_penalty,
                 terminal_inventory_penalty=terminal_inventory_penalty,
