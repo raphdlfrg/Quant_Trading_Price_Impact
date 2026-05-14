@@ -460,9 +460,10 @@ def plot_one_stock_day_pnl_comparison(paths, stock, date):
 
 def plot_one_stock_day_final_pnl_bar(summary_df, stock, date):
     plot_df = summary_df.copy()
+    colors = plt.cm.tab10(np.linspace(0, 1, len(plot_df)))
 
     plt.figure(figsize=(9, 4))
-    plt.bar(plot_df.index, plot_df["daily_pnl"])
+    plt.bar(plot_df.index, plot_df["daily_pnl"], color=colors)
     plt.axhline(0, linestyle="--", linewidth=1)
     plt.title(f"{stock} {date} - Final PnL by strategy")
     plt.ylabel("Daily PnL")
@@ -473,9 +474,10 @@ def plot_one_stock_day_final_pnl_bar(summary_df, stock, date):
 
 def plot_one_stock_day_impact_cost_bar(summary_df, stock, date):
     plot_df = summary_df.copy()
+    colors = plt.cm.tab10(np.linspace(0, 1, len(plot_df)))
 
     plt.figure(figsize=(9, 4))
-    plt.bar(plot_df.index, plot_df["impact_cost"])
+    plt.bar(plot_df.index, plot_df["impact_cost"], color=colors)
     plt.axhline(0, linestyle="--", linewidth=1)
     plt.title(f"{stock} {date} - Impact cost by strategy")
     plt.ylabel("Impact cost")
