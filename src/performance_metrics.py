@@ -3,6 +3,139 @@ import pandas as pd
 from src.optimal_trading_strategy import *
 
 
+##########------- Alpha Correlation ---------############
+
+def alpha_forward_return_corr(alpha_df, px_df, horizon_bins=1):
+    """
+    Compute alpha-forward-return correlation per stock.
+
+    alpha_df:
+        index   = (stock, date)
+        columns = intraday time bins
+        values  = alpha signal used by the strategy
+
+    px_df:
+        index   = (stock, date)
+        columns = intraday time bins
+        values  = prices
+
+    horizon_bins:
+        number of intraday bins ahead used to compute future return
+    """
+
+    common_index = alpha_df.index.intersection(px_df.index)
+    common_cols = alpha_df.columns.intersection(px_df.columns)
+
+    alpha = alpha_df.loc[common_index, common_cols].astype(float)
+    px = px_df.loc[common_index, common_cols].astype(float)
+
+    future_px = px.shift(-horizon_bins, axis=1)
+    fwd_return = (future_px - px) / px
+
+    rows = []
+
+    stocks = alpha.index.get_level_values(0).unique()
+
+    for stock in stocks:
+        alpha_stock = alpha.loc[stock].to_numpy().ravel()
+        ret_stock = fwd_return.loc[stock].to_numpy().ravel()
+
+        valid = (
+            np.isfinite(alpha_stock)
+            & np.isfinite(ret_stock)
+        )
+
+        alpha_valid = alpha_stock[valid]
+        ret_valid = ret_stock[valid]
+
+        if len(alpha_valid) > 2:
+            corr = np.corrcoef(alpha_valid, ret_valid)[0, 1]
+        else:
+            corr = np.nan
+
+        rows.append({
+            "stock": stock,
+            "horizon_bins": horizon_bins,
+            "alpha_return_corr": corr,
+            "n_obs": len(alpha_valid),
+        })
+
+    corr_df = pd.DataFrame(rows).set_index("stock").sort_index()
+
+    return corr_df
+
+## Correlation by stock
+
+def plot_alpha_corr_by_stock(corr_df, title=None):
+    """
+    Bar plot of alpha-return correlation by stock.
+    """
+
+    ax = corr_df["alpha_return_corr"].plot(
+        kind="bar",
+        figsize=(12, 5)
+    )
+
+    ax.axhline(0, color="black", linewidth=1)
+
+    if title is None:
+        horizon_bins = corr_df["horizon_bins"].iloc[0]
+        title = f"Alpha-forward-return correlation by stock, horizon={horizon_bins} bins"
+
+    ax.set_title(title)
+    ax.set_ylabel("Correlation")
+    ax.set_xlabel("Stock")
+
+    plt.tight_layout()
+    plt.show()
+
+## Correlation across horizons
+def plot_alpha_corr_by_horizon(alpha_df, px_df, horizon_bins_list):
+    """
+    Compute and plot average alpha-return correlation across horizons.
+    """
+
+    rows = []
+
+    for horizon_bins in horizon_bins_list:
+        corr_df = alpha_forward_return_corr(
+            alpha_df=alpha_df,
+            px_df=px_df,
+            horizon_bins=horizon_bins
+        )
+
+        rows.append({
+            "horizon_bins": horizon_bins,
+            "mean_corr": corr_df["alpha_return_corr"].mean(),
+            "median_corr": corr_df["alpha_return_corr"].median(),
+            "min_corr": corr_df["alpha_return_corr"].min(),
+            "max_corr": corr_df["alpha_return_corr"].max(),
+            "n_stocks": corr_df["alpha_return_corr"].notna().sum(),
+        })
+
+    horizon_df = pd.DataFrame(rows)
+
+    ax = horizon_df.plot(
+        x="horizon_bins",
+        y=["mean_corr", "median_corr"],
+        marker="o",
+        figsize=(9, 5)
+    )
+
+    ax.axhline(0, color="black", linewidth=1)
+    ax.set_title("Alpha-forward-return correlation across prediction horizons")
+    ax.set_xlabel("Horizon bins")
+    ax.set_ylabel("Correlation")
+
+    plt.tight_layout()
+    plt.show()
+
+    return horizon_df
+
+
+#---------------------------------------------------------#
+
+
 def run_one_stock_day_paths_for_strategies(
     stock,
     date,
